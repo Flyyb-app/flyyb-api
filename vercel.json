@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "/api/auth",
+      "dest": "/api/auth.js"
+    },
+    {
+      "src": "/api/search",
+      "dest": "/api/search.js"
+    },
+    {
+      "src": "/api/booking",
+      "dest": "/api/booking.js"
+    },
+    {
+      "src": "/api/trips",
+      "dest": "/api/trips.js"
+    },
+    {
+      "src": "/api/profiles",
+      "dest": "/api/profiles.js"
+    },
+    {
+      "src": "/api/chat",
+      "dest": "/api/chat.js"
+    }
+  ]
+}
