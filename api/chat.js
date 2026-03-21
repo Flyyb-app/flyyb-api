@@ -5,7 +5,7 @@ var pool = new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUna
 var AIRA_SYSTEM = 'You are AIRA (AI Reservations Assistant), FLYYBs premium AI flight concierge. You are warm, efficient and feel like a knowledgeable air hostess who knows the passenger personally. Speak in short clear sentences. Use the users first name naturally. Never ask for info you already have. Present max 3 flight options at a time. Celebrate bookings enthusiastically. Always be helpful and positive. FLYYB Policies: free cancellation up to 24h before departure, rescheduling up to 48h before, earn 5% credits on every booking, credits pay up to 20% of any booking. Baggage: economy 23kg checked + 7kg cabin, business 32kg checked + 10kg cabin. Online check-in opens 24h before departure.';
 
 var COUNTRY_CURRENCY = {US:'USD',GB:'GBP',IN:'INR',AU:'AUD',CA:'CAD',SG:'SGD',AE:'AED',JP:'JPY',DE:'EUR',FR:'EUR',NZ:'NZD',MY:'MYR',TH:'THB',PH:'PHP',ID:'IDR',VN:'VND',KR:'KRW',CN:'CNY',HK:'HKD',TW:'TWD',PK:'PKR',BD:'BDT',LK:'LKR',NP:'NPR',QA:'QAR',SA:'SAR'};
-var CURR_SYMBOLS     = {USD:'$',EUR:'\u20ac',GBP:'\u00a3',INR:'\u20b9',JPY:'\u00a5',AUD:'A$',CAD:'C$',SGD:'S$',AED:'AED',CHF:'CHF',CNY:'\u00a5',HKD:'HK$',KRW:'\u20a9',MYR:'RM',THB:'\u0e3f',IDR:'Rp',PHP:'\u20b1',VND:'\u20ab',TWD:'NT$',NZD:'NZ$',BRL:'R$',MXN:'MX$',ZAR:'R',TRY:'\u20ba',SEK:'kr',NOK:'kr',DKK:'kr',PKR:'\u20a8',BDT:'\u09f3',LKR:'\u20a8',NPR:'\u20a8',QAR:'QAR',SAR:'SAR'};
+var CURR_SYMBOLS = {USD:'$',EUR:'\u20ac',GBP:'\u00a3',INR:'\u20b9',JPY:'\u00a5',AUD:'A$',CAD:'C$',SGD:'S$',AED:'AED',CHF:'CHF',CNY:'\u00a5',HKD:'HK$',KRW:'\u20a9',MYR:'RM',THB:'\u0e3f',IDR:'Rp',PHP:'\u20b1',VND:'\u20ab',TWD:'NT$',NZD:'NZ$',BRL:'R$',MXN:'MX$',ZAR:'R',TRY:'\u20ba',SEK:'kr',NOK:'kr',DKK:'kr',PKR:'\u20a8',BDT:'\u09f3',LKR:'\u20a8',NPR:'\u20a8',QAR:'QAR',SAR:'SAR'};
 
 var ratesCache = null, ratesCacheTime = 0;
 
@@ -59,9 +59,7 @@ async function searchFlights(from,to,date,cabin,currency){
         arrival:f.arr_time?f.arr_time.slice(0,5):'',
         durationMin:f.duration_min,
         duration:Math.floor(f.duration_min/60)+'h '+(f.duration_min%60)+'m',
-        cabin:cabin,
-        stops:0,
-        via:null,
+        cabin:cabin,stops:0,via:null,
         price:{perPerson:conv.amount,symbol:conv.symbol,currency:conv.code},
         seats:{available:Math.max(1,Math.floor(f.total_seats*(advanceDays>30?0.7:0.3))),alert:null},
         aircraft:f.aircraft_type
@@ -95,8 +93,8 @@ function parseNaturalDate(text){
 }
 
 async function extractFlightIntent(message,context,apiKey){
-  var url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+apiKey;
-  var prompt='Extract flight search intent. Return ONLY valid JSON, no markdown: {"from_city":null,"to_city":null,"date_text":null,"cabin":null,"passengers":null,"is_flight_search":false}. Message: "'+message+'" Context: '+context;
+  var url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+apiKey;
+  var prompt='Extract flight search intent. Return ONLY valid JSON no markdown: {"from_city":null,"to_city":null,"date_text":null,"cabin":null,"passengers":null,"is_flight_search":false}. Message: "'+message.replace(/"/g,"'")+'" Context: '+context;
   try{
     var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{role:'user',parts:[{text:prompt}]}],generationConfig:{maxOutputTokens:150,temperature:0}})});
     var d=await r.json();
@@ -127,7 +125,8 @@ async function handleAira(message,history,context,apiKey,res){
       if(fromAP&&toAP){
         var dateStr=intent.date_text?parseNaturalDate(intent.date_text):parseNaturalDate('next week');
         var cabin=intent.cabin||'economy';
-        var currency=context.match(/Currency: ([A-Z]{3})/)?context.match(/Currency: ([A-Z]{3})/)[1]:'USD';
+        var currMatch=context.match(/Currency: ([A-Z]{3})/);
+        var currency=currMatch?currMatch[1]:'USD';
         var flights=await searchFlights(fromAP.iata_code,toAP.iata_code,dateStr,cabin,currency);
         if(flights.length){
           var dateDisp=new Date(dateStr).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
@@ -135,8 +134,8 @@ async function handleAira(message,history,context,apiKey,res){
         }
         return res.json({reply:'No flights found from '+fromAP.city+' to '+toAP.city+' on that date. Try different dates or cabin class?'});
       }
-      if(!fromAP)return res.json({reply:'I could not find the departure airport for "'+intent.from_city+'". Could you try the airport code (e.g. DEL, BOM, DXB)?'});
-      if(!toAP)return res.json({reply:'I could not find the arrival airport for "'+intent.to_city+'". Could you try the airport code?'});
+      if(!fromAP) return res.json({reply:'Could not find airport for "'+intent.from_city+'". Try the airport code e.g. SIN, MAA, DEL?'});
+      if(!toAP)   return res.json({reply:'Could not find airport for "'+intent.to_city+'". Try the airport code?'});
     }
     var contents=[],lastRole=null;
     history.forEach(function(m){
@@ -145,9 +144,9 @@ async function handleAira(message,history,context,apiKey,res){
     });
     while(contents.length&&contents[0].role==='model')contents.shift();
     if(contents.length&&contents[contents.length-1].role==='user')contents.pop();
-    var userMsg=context?'[Context: '+context+']\n\n'+message:message;
+    var userMsg=context?('[Context: '+context+']\n\n'+message):message;
     contents.push({role:'user',parts:[{text:userMsg}]});
-    var url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+apiKey;
+    var url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+apiKey;
     var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:AIRA_SYSTEM}]},contents:contents,generationConfig:{maxOutputTokens:300,temperature:0.8}})});
     var d=await r.json();
     if(d.error){console.error('Gemini:',d.error.message);return res.status(500).json({error:'Chat unavailable'});}
