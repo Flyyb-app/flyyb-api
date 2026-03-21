@@ -152,6 +152,47 @@ async function handleLogout(req,res){
   catch(err){res.status(500).json({error:'Logout failed'});}
   finally{if(client)client.release();}
 }
+
+async function handleSendLoginOTP(req,res){
+  var b=req.body||{},phone=b.phone;
+  if(!phone)return res.status(400).json({error:'Phone required'});
+  var client;
+  try{
+    client=await pool.connect();
+    var ur=await client.query('SELECT id,name FROM users WHERE phone=$1',[phone]);
+    if(!ur.rows.length)return res.status(404).json({error:'No account found for this number. Please register first.'});
+    var otp=genOTP(),oh=await hashOTP(otp),exp=new Date(Date.now()+10*60*1000);
+    await client.query('INSERT INTO otp_verifications (email,otp_hash,purpose,expires_at) VALUES ($1,$2,$3,$4)',[phone,oh,'login',exp]);
+    await smsOtpGenerationForMobileNo(phone,otp,ur.rows[0].name);
+    res.json({message:'OTP sent'});
+  }catch(err){console.error('SendLoginOTP:',err);res.status(500).json({error:'Failed to send OTP'});}
+  finally{if(client)client.release();}
+}
+
+async function handleLoginOTP(req,res){
+  var b=req.body||{},phone=b.phone,otp=b.otp;
+  if(!phone||!otp)return res.status(400).json({error:'Phone and OTP required'});
+  var client;
+  try{
+    client=await pool.connect();
+    var rows=await client.query('SELECT id,otp_hash,expires_at FROM otp_verifications WHERE email=$1 AND purpose=$2 AND used=FALSE ORDER BY created_at DESC LIMIT 1',[phone,'login']);
+    if(!rows.rows.length)return res.status(400).json({error:'No pending OTP found'});
+    var rec=rows.rows[0];
+    if(new Date(rec.expires_at)<new Date())return res.status(400).json({error:'OTP expired'});
+    var valid=await verifyOTP(otp,rec.otp_hash);
+    if(!valid)return res.status(400).json({error:'Invalid OTP'});
+    await client.query('UPDATE otp_verifications SET used=TRUE WHERE id=$1',[rec.id]);
+    var ur=await client.query('SELECT id,name,email,phone,flyyb_id,default_currency FROM users WHERE phone=$1',[phone]);
+    var user=ur.rows[0];
+    if(!user)return res.status(404).json({error:'User not found'});
+    var at=authLib.signAccessToken(user),rt=authLib.generateRefreshToken(),rh=await authLib.hashToken(rt),exp=new Date(Date.now()+30*24*60*60*1000);
+    await client.query('INSERT INTO refresh_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,$3)',[user.id,rh,exp]);
+    var cr=await client.query('SELECT balance FROM credits WHERE user_id=$1',[user.id]);
+    res.json({user:{id:user.id,name:user.name,email:user.email||null,phone:user.phone,flyybId:user.flyyb_id,currency:user.default_currency},accessToken:at,refreshToken:rt,expiresIn:3600,credits:parseFloat((cr.rows[0]&&cr.rows[0].balance)||0)});
+  }catch(err){console.error('LoginOTP:',err);res.status(500).json({error:'Login failed'});}
+  finally{if(client)client.release();}
+}
+
 module.exports=function(req,res){
   if(authLib.cors(req,res))return;
   var a=req.query.action;
@@ -161,6 +202,8 @@ module.exports=function(req,res){
   if(a==='login')      return handleLogin(req,res);
   if(a==='me')         return handleMe(req,res);
   if(a==='logout')     return handleLogout(req,res);
+  if(a==='send-login-otp') return handleSendLoginOTP(req,res);
+  if(a==='login-otp')  return handleLoginOTP(req,res);
   if(a==='config')     return res.json({stripeKey: process.env.STRIPE_PK||''});
   return res.status(400).json({error:'Missing action'});
 };

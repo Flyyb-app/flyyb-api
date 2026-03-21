@@ -19,8 +19,8 @@ module.exports=function(req,res){
   var url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+apiKey;
   return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({systemInstruction:{parts:[{text:SYSTEM}]},contents:contents,generationConfig:{maxOutputTokens:400,temperature:0.7}})})
   .then(function(r){return r.json();}).then(function(d){
-    if(d.error)return res.status(500).json({error:'Chat unavailable'});
+    if(d.error){console.error('Gemini:',JSON.stringify(d.error));return res.status(500).json({error:'Chat unavailable'});}
     var reply=d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts&&d.candidates[0].content.parts[0]&&d.candidates[0].content.parts[0].text;
     res.json({reply:reply||'Sorry, could not process that.'});
-  }).catch(function(e){res.status(500).json({error:'Chat unavailable'});});
+  }).catch(function(e){console.error('Chat:',e.message);res.status(500).json({error:'Chat unavailable'});});
 };
