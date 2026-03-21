@@ -161,5 +161,6 @@ module.exports=function(req,res){
   if(a==='login')      return handleLogin(req,res);
   if(a==='me')         return handleMe(req,res);
   if(a==='logout')     return handleLogout(req,res);
+  if(a==='config')     return res.json({stripeKey: process.env.STRIPE_PK||''});
   return res.status(400).json({error:'Missing action'});
 };
