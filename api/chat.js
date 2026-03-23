@@ -1,6 +1,38 @@
 var auth = require('../lib/auth');
+var knowledge = require('./aira');
 
-var AIRA_SYSTEM = 'You are AIRA (AI Reservations Assistant), FLYYBs premium AI flight concierge. You are warm, efficient and feel like a knowledgeable air hostess who knows the passenger personally. Speak in short clear sentences. Use the users first name naturally. Never ask for info you already have. When a user asks to search flights or mentions a route, always respond with ONLY this exact JSON on one line and nothing else: {"action":"search","from":"CITY","to":"CITY","date":"DATE_AS_SPOKEN","cabin":"economy"}. For all other questions respond normally as AIRA. FLYYB Policies: free cancellation up to 24h before departure, rescheduling up to 48h before, earn 5% credits on every booking, credits pay up to 20% of any booking. Baggage: economy 23kg checked + 7kg cabin, business 32kg checked + 10kg cabin. Online check-in opens 24h before departure.';
+var AIRA_SYSTEM = [
+'You are AIRA (AI Reservations Assistant), FLYYBs premium AI flight concierge.',
+'You are warm, efficient and feel like a knowledgeable air hostess who knows the passenger personally.',
+'Speak in short clear sentences. Use the users first name naturally.',
+'',
+'FLIGHT SEARCH RULE - CRITICAL:',
+'When a user asks to search, find, book, or mentions any flight route (e.g. "fly to Dubai", "Singapore to Chennai", "book flight to London next Friday"), you MUST respond with ONLY this exact JSON on a single line - no other text, no markdown, no explanation:',
+'{"action":"search","from":"CITY_OR_CODE","to":"CITY_OR_CODE","date":"DATE_AS_SPOKEN","cabin":"economy"}',
+'If the user mentions a cabin class, use it (economy/business/first). If from/to is missing, use empty string "".',
+'Examples:',
+'- "fly to Dubai next week" -> {"action":"search","from":"","to":"Dubai","date":"next week","cabin":"economy"}',
+'- "Singapore to Chennai April 9" -> {"action":"search","from":"Singapore","to":"Chennai","date":"April 9","cabin":"economy"}',
+'- "book flight next sunday" -> {"action":"search","from":"","to":"","date":"next sunday","cabin":"economy"}',
+'- "business class London to NYC" -> {"action":"search","from":"London","to":"New York","date":"next week","cabin":"business"}',
+'',
+'BOOKING RULE - CRITICAL:',
+'NEVER confirm a booking or say a flight is booked. NEVER say things like "your flight is booked" or "booking confirmed".',
+'If a user says "book", "confirm", "proceed", "yes", "ok", "go ahead" - respond warmly and say you are opening the booking form for them.',
+'The actual booking happens in the app, not in chat.',
+'',
+'MISSING INFO RULE:',
+'If from/to is missing, ask the user: "Sure! Where are you flying from, and where to?"',
+'',
+'FLYYB POLICIES:',
+'Free cancellation up to 24h before departure. Rescheduling up to 48h before.',
+'Earn 5% credits on every booking. Credits pay up to 20% of any booking.',
+'Baggage: economy 23kg checked + 7kg cabin, business 32kg checked + 10kg cabin.',
+'Online check-in opens 24h before departure.',
+'',
+'For general questions, respond as a helpful, friendly travel concierge.',
+'Keep responses concise - max 3 sentences for general answers.',
+].join('\n');
 
 var COUNTRY_CURRENCY = {US:'USD',GB:'GBP',IN:'INR',AU:'AUD',CA:'CAD',SG:'SGD',AE:'AED',JP:'JPY',DE:'EUR',FR:'EUR',NZ:'NZD',MY:'MYR',TH:'THB',PH:'PHP',ID:'IDR',VN:'VND',KR:'KRW',CN:'CNY',HK:'HKD',TW:'TWD',PK:'PKR',BD:'BDT',LK:'LKR',NP:'NPR',QA:'QAR',SA:'SAR'};
 var CURR_SYMBOLS = {USD:'$',EUR:'\u20ac',GBP:'\u00a3',INR:'\u20b9',JPY:'\u00a5',AUD:'A$',CAD:'C$',SGD:'S$',AED:'AED',CHF:'CHF',CNY:'\u00a5',HKD:'HK$',KRW:'\u20a9',MYR:'RM',THB:'\u0e3f',IDR:'Rp',PHP:'\u20b1',VND:'\u20ab',TWD:'NT$',NZD:'NZ$',BRL:'R$',MXN:'MX$',ZAR:'R',TRY:'\u20ba',SEK:'kr',NOK:'kr',DKK:'kr',PKR:'\u20a8',BDT:'\u09f3',LKR:'\u20a8',NPR:'\u20a8',QAR:'QAR',SAR:'SAR'};
@@ -96,23 +128,14 @@ var d=new Date(now);d.setDate(d.getDate()+7);return d.toISOString().split('T')[0
 }
 
 async function resolveAirport(city){
-if(!city)return null;
+if(!city||city.trim()==='')return null;
 var client;
 try{
 client=await getPool().connect();
-var r=await client.query('SELECT iata_code,city,name FROM airports WHERE lower(iata_code)=lower($1) OR lower(city) LIKE lower($2) OR lower(name) LIKE lower($2) ORDER BY is_major DESC LIMIT 1',[city,'%'+city+'%']);
+var r=await client.query('SELECT iata_code,city,name FROM airports WHERE lower(iata_code)=lower($1) OR lower(city) LIKE lower($2) OR lower(name) LIKE lower($2) ORDER BY is_major DESC LIMIT 1',[city.trim(),'%'+city.trim()+'%']);
 return r.rows[0]||null;
 }catch(e){return null;}
 finally{if(client)client.release();}
-}
-
-function isFlightQuery(message){
-var t=message.toLowerCase();
-var flightWords=['to ','flight','fly','book','from ','ticket','travel'];
-var placeWords=['airport','city','london','dubai','singapore','chennai','mumbai','delhi','new york','paris','tokyo','sydney','bangkok','hong kong','kuala lumpur','jakarta','manila','colombo','karachi','dhaka','kathmandu','doha','riyadh','abu dhabi'];
-var hasRoute=/\b(from|to)\s+\w+/.test(t)||/\w+\s+to\s+\w+/.test(t);
-var hasFlightWord=flightWords.some(function(w){return t.includes(w);});
-return hasRoute||hasFlightWord;
 }
 
 async function handleAira(message,history,context,apiKey,res){
@@ -120,7 +143,6 @@ try{
 var url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+apiKey;
 
 
-// Build conversation history
 var contents=[],lastRole=null;
 history.forEach(function(m){
   var role=m.role==='assistant'?'model':'user';
@@ -128,79 +150,69 @@ history.forEach(function(m){
 });
 while(contents.length&&contents[0].role==='model')contents.shift();
 if(contents.length&&contents[contents.length-1].role==='user')contents.pop();
-
-var userMsg=context?('[User context: '+context+']\n\n'+message):message;
+// RAG: inject relevant knowledge for this query
+var ragContext=knowledge.getRelevantKnowledge(message);
+var ragStr=ragContext.length?('\n\nRelevant FLYYB knowledge:\n'+ragContext.join('\n')):'';
+var userMsg=(context?('[User context: '+context+']\n'):'')+(ragStr?ragStr+'\n\n':'')+message;
 contents.push({role:'user',parts:[{text:userMsg}]});
 
-// Call Gemini
 var r=await fetch(url,{
   method:'POST',
   headers:{'Content-Type':'application/json'},
   body:JSON.stringify({
     systemInstruction:{parts:[{text:AIRA_SYSTEM}]},
     contents:contents,
-    generationConfig:{maxOutputTokens:300,temperature:0.7}
+    generationConfig:{maxOutputTokens:300,temperature:0.6}
   })
 });
 var d=await r.json();
 if(d.error){console.error('Gemini:',d.error.message);return res.status(500).json({error:'Chat unavailable'});}
 
 var reply=d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts&&d.candidates[0].content.parts[0]&&d.candidates[0].content.parts[0].text;
-if(!reply)return res.json({reply:'I am not sure about that. Could you rephrase?'});
-
+if(!reply)return res.json({reply:"I'm not sure about that. Could you rephrase?"});
 reply=reply.trim();
 
-// Check if Gemini returned a search action JSON
-var actionMatch=reply.match(/\{"action"\s*:\s*"search"[^}]+\}/);
+// Check if Gemini returned search action JSON
+var actionMatch=reply.match(/\{"action"\s*:\s*"search"[^}]*\}/);
 if(actionMatch){
   try{
     var intent=JSON.parse(actionMatch[0]);
-    if(intent.from&&intent.to){
-      var fromAP=await resolveAirport(intent.from);
-      var toAP=await resolveAirport(intent.to);
-      if(fromAP&&toAP){
-        var dateStr=intent.date?parseNaturalDate(intent.date):parseNaturalDate('next week');
-        var cabin=intent.cabin||'economy';
-        var currMatch=context.match(/Currency: ([A-Z]{3})/);
-        var currency=currMatch?currMatch[1]:'USD';
-        var flights=await searchFlights(fromAP.iata_code,toAP.iata_code,dateStr,cabin,currency);
-        if(flights.length){
-          var dateDisp=new Date(dateStr).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
-          return res.json({action:'show_flights',flights:flights,from:fromAP.city,to:toAP.city,date:dateDisp,reply:'Found '+flights.length+' flights!'});
-        }
-        return res.json({reply:'No flights found from '+fromAP.city+' to '+toAP.city+' on that date. Try different dates?'});
-      }
-      if(!fromAP)return res.json({reply:'Could not find "'+intent.from+'" airport. Try using the airport code e.g. SIN, MAA, DEL?'});
-      if(!toAP)return res.json({reply:'Could not find "'+intent.to+'" airport. Try using the airport code?'});
+    // Handle missing from/to
+    if(!intent.from&&!intent.to){
+      return res.json({reply:"Sure! Where would you like to fly from, and where to?"});
     }
-  }catch(e){console.error('Intent parse error:',e.message);}
-}
-
-// Also catch if Gemini described flights in text despite instructions - do direct search
-if(isFlightQuery(message)&&!actionMatch){
-  // Try direct keyword extraction as fallback
-  var words=message.toLowerCase().split(/\s+/);
-  var toIdx=words.indexOf('to');
-  var fromIdx=words.indexOf('from');
-  var fromCity=fromIdx>=0?words.slice(fromIdx+1,toIdx>=0?toIdx:fromIdx+3).join(' '):null;
-  var toCity=toIdx>=0?words.slice(toIdx+1,toIdx+3).join(' '):null;
-  if(fromCity&&toCity){
-    var fromAP=await resolveAirport(fromCity);
-    var toAP=await resolveAirport(toCity);
+    if(!intent.to){
+      return res.json({reply:"Got it! Where would you like to fly to?"});
+    }
+    if(!intent.from){
+      return res.json({reply:"Great destination! Where are you flying from?"});
+    }
+    var fromAP=await resolveAirport(intent.from);
+    var toAP=await resolveAirport(intent.to);
     if(fromAP&&toAP){
-      var dateStr=parseNaturalDate(message);
+      var dateStr=intent.date?parseNaturalDate(intent.date):parseNaturalDate('next week');
+      var cabin=intent.cabin||'economy';
       var currMatch=context.match(/Currency: ([A-Z]{3})/);
       var currency=currMatch?currMatch[1]:'USD';
-      var flights=await searchFlights(fromAP.iata_code,toAP.iata_code,dateStr,'economy',currency);
+      var flights=await searchFlights(fromAP.iata_code,toAP.iata_code,dateStr,cabin,currency);
       if(flights.length){
         var dateDisp=new Date(dateStr).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'});
         return res.json({action:'show_flights',flights:flights,from:fromAP.city,to:toAP.city,date:dateDisp,reply:'Found '+flights.length+' flights!'});
       }
+      return res.json({reply:'No flights found from '+fromAP.city+' to '+toAP.city+' on that date. Try different dates or cabin class?'});
     }
-  }
+    if(!fromAP) return res.json({reply:'I couldn\'t find "'+intent.from+'" as an airport. Could you try the airport code e.g. SIN, DEL, DXB?'});
+    if(!toAP)   return res.json({reply:'I couldn\'t find "'+intent.to+'" as an airport. Could you try the airport code?'});
+  }catch(e){console.error('Intent parse:',e.message);}
 }
 
-// Regular conversational reply
+// Block any hallucinated booking confirmations from Gemini
+var lowerReply=reply.toLowerCase();
+if((lowerReply.includes('booked')||lowerReply.includes('booking confirmed')||lowerReply.includes('confirmation')&&lowerReply.includes('sent'))
+   &&!lowerReply.includes('?')&&!lowerReply.includes('would you')){
+  return res.json({reply:"I'll open the booking form for you now! Just tap 'Book Now' to proceed."});
+}
+
 res.json({reply:reply});
 
 
