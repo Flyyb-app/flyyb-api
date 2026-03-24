@@ -105,25 +105,39 @@ finally{if(client)client.release();}
 }
 
 function parseNaturalDate(text){
-var now=new Date();
-var t=(text||'').toLowerCase();
+var now=new Date();now.setHours(0,0,0,0);
+var t=(text||'').toLowerCase().trim();
+if(!t||t==='null'||t==='undefined')return new Date(now.getTime()+7*86400000).toISOString().split('T')[0];
+if(t==='today')return now.toISOString().split('T')[0];
 if(t.includes('tomorrow')){var d=new Date(now);d.setDate(d.getDate()+1);return d.toISOString().split('T')[0];}
 var days=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
 for(var i=0;i<days.length;i++){
-if(t.includes('next '+days[i])||t.includes('this '+days[i])){
-var d=new Date(now);var diff=(i-d.getDay()+7)%7||7;
+if(t.includes('next '+days[i])||t.includes('this '+days[i])||t===days[i]){
+var d=new Date(now);var diff=(i-d.getDay()+7)%7;
+if(diff===0||t.includes('next'))diff=diff||7;
 d.setDate(d.getDate()+diff);return d.toISOString().split('T')[0];
 }
 }
-var dm=t.match(/in (\d+) days?/);
-if(dm){var d=new Date(now);d.setDate(d.getDate()+parseInt(dm[1]));return d.toISOString().split('T')[0];}
+var dm=t.match(/in (\d+) days?/);if(dm){var d=new Date(now);d.setDate(d.getDate()+parseInt(dm[1]));return d.toISOString().split('T')[0];}
+var wm=t.match(/in (\d+) weeks?/);if(wm){var d=new Date(now);d.setDate(d.getDate()+parseInt(wm[1])*7);return d.toISOString().split('T')[0];}
 var months=['january','february','march','april','may','june','july','august','september','october','november','december'];
+var monthShort=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
 for(var i=0;i<months.length;i++){
-if(t.includes(months[i])){
-var nm=t.match(/\b(\d{1,2})\b/);
-if(nm){var d=new Date(now.getFullYear(),i,parseInt(nm[1]));if(d<now)d.setFullYear(d.getFullYear()+1);return d.toISOString().split('T')[0];}
+var hasMon=t.includes(months[i])||t.includes(monthShort[i]);
+if(hasMon){
+var yearMatch=t.match(/(202\d)/);
+var dayMatch=t.match(/(\d{1,2})(?:st|nd|rd|th)?/);
+var year=yearMatch?parseInt(yearMatch[1]):now.getFullYear();
+if(dayMatch){
+var day=parseInt(dayMatch[1]);
+var d=new Date(year,i,day);
+if(d<=now&&!yearMatch)d.setFullYear(d.getFullYear()+1);
+return d.toISOString().split('T')[0];
 }
 }
+}
+var isoMatch=t.match(/(\d{4}-\d{2}-\d{2})/);
+if(isoMatch)return isoMatch[0];
 var d=new Date(now);d.setDate(d.getDate()+7);return d.toISOString().split('T')[0];
 }
 
