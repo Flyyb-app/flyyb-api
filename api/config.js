@@ -5,7 +5,7 @@
 - GET /api/config
 - 
 - Returns public-safe configuration values to the frontend.
-- Currently exposes the Stripe PUBLISHABLE key (pk_live_…) only.
+- Currently exposes the Stripe PUBLISHABLE key (pk_live_) only.
 - 
 - WHY this approach:
 - The Stripe publishable key is safe to expose publicly — it can only
@@ -16,7 +16,7 @@
   
 - • You can rotate it in Vercel env vars with zero code changes
   
-- • It works identically for test (pk_test_…) and live (pk_live_…)
+- • It works identically for test (pk_test_) and live (pk_live_)
   
 - environments based on which Vercel environment is active
   
@@ -25,7 +25,7 @@
 - STRIPE_PUBLISHABLE_KEY  →  pk_live_xxxx   (production) →  pk_test_xxxx   (preview / development)
   
 - 
-- NEVER put the secret key (sk_live_…) here — that lives only in
+- NEVER put the secret key (sk_live_) here — that lives only in
 - STRIPE_SECRET_KEY and is used server-side in api/booking.js only.
 - 
 - No auth required — this endpoint is intentionally public.

@@ -70,7 +70,7 @@ return serverError(res, err);
 }
 
 // Mark lowest price as best value
-const flights = rows.map((f, i) => ({ …f, price: Number(f.price), best: i === 0 }));
+const flights = rows.map((f, i) => ({ f, price: Number(f.price), best: i === 0 }));
 
 console.log('[Search] ${origin}→${dest} ${date} adults=${adults} cabin=${cabin} → ${flights.length} results');
 return ok(res, { flights });

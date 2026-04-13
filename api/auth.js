@@ -3,7 +3,7 @@
 - FLYYB API — api/auth.js
 - 
 - POST /api/auth
-- Body: { action, …fields }
+- Body: { action, fields }
 - 
 - Actions:
 - login     → { email, password }
