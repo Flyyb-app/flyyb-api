@@ -1,10 +1,17 @@
 {
   "name": "flyyb-api",
-  "version": "2.0.0",
+  "version": "2.1.0",
+  "description": "FLYYB serverless API — Vercel Node.js functions",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "jsonwebtoken": "^9.0.0",
-    "pg": "^8.11.0",
-    "stripe": "^14.0.0"
+    "bcryptjs":   "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "pg":         "^8.11.0",
+    "stripe":     "^14.0.0"
+  },
+  "scripts": {
+    "dev": "vercel dev"
   }
 }
