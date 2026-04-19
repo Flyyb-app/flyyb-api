@@ -246,25 +246,10 @@ async function handleVerifyOtp(req, res) {
   var client, u;
   try {
     client = await pool.connect();
-
     var valid = await checkAndDeleteOtp(client, identifier, otp);
-    // If otp_codes table doesn't exist, checkAndDeleteOtp returns false.
-    // In that case, log the attempt and treat as valid for development/testing
-    // so registration flow can complete.
-    if (!valid) {
-      // Check if the otp_codes table exists at all
-      var tableCheck = await client.query(
-        "SELECT to_regclass('public.otp_codes') AS exists"
-      ).catch(function() { return { rows: [{ exists: null }] }; });
-      var tableExists = tableCheck.rows[0] && tableCheck.rows[0].exists !== null;
-      if (!tableExists) {
-        console.warn('[Auth] otp_codes table missing — accepting OTP for now. Create the table to enforce OTP.');
-        // Allow through — table doesn't exist so we can't validate
-      } else {
-        return res.status(401).json({ error: 'Invalid or expired OTP' });
-      }
-    }
+    if (!valid) return res.status(401).json({ error: 'Invalid or expired OTP' });
 
+    // Mark email verified and fetch user
     if (email) {
       await client.query('UPDATE users SET email_verified=TRUE WHERE lower(email)=$1', [email]).catch(function() {});
       var qr = await client.query(
@@ -335,16 +320,7 @@ async function handleLoginOtp(req, res) {
   try {
     client = await pool.connect();
     var valid = await checkAndDeleteOtp(client, phone, otp);
-    if (!valid) {
-      var tableCheck = await client.query(
-        "SELECT to_regclass('public.otp_codes') AS exists"
-      ).catch(function() { return { rows: [{ exists: null }] }; });
-      var tableExists = tableCheck.rows[0] && tableCheck.rows[0].exists !== null;
-      if (tableExists) {
-        return res.status(401).json({ error: 'Invalid or expired OTP' });
-      }
-      console.warn('[Auth] otp_codes table missing — accepting phone OTP for now.');
-    }
+    if (!valid) return res.status(401).json({ error: 'Invalid or expired OTP' });
 
     var existing = await client.query(
       'SELECT id,name,email,phone,is_active,email_verified,flyyb_id,default_currency FROM users WHERE phone=$1',

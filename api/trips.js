@@ -38,7 +38,7 @@ async function listTrips(req, res, user) {
   try {
     client = await pool.connect();
     var r = await client.query(
-      'SELECT b.booking_ref AS "bookingRef", b.status, b.total_paid AS total, b.cabin, ' +
+      'SELECT b.booking_ref AS "bookingRef", b.status, b.total_amount AS total, b.cabin, ' +
       'b.dep_date AS date, b.dep_time AS departure, b.arr_time AS arrival, ' +
       'b.origin_code AS origin, b.dest_code AS destination, ' +
       'b.airline_code AS airline, b.flight_number AS "flightNumber" ' +
