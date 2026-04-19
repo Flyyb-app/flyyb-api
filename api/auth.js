@@ -1,281 +1,443 @@
 /**
  * FLYYB API — api/auth.js
- * POST /api/auth?action=...
  *
- * Actions: login | register | send-login-otp | login-otp |
- *          verify-otp | resend-otp | refresh | logout
- *
- * Env vars: DATABASE_URL, JWT_SECRET
+ * POST /api/auth?action=login          { email, password } | { phone, password }
+ * POST /api/auth?action=register       { name, email, password, currency } | { name, phone, dial, currency, provider:'phone' }
+ * POST /api/auth?action=send-login-otp { phone }
+ * POST /api/auth?action=login-otp      { phone, otp }
+ * POST /api/auth?action=verify-otp     { email, otp }
+ * POST /api/auth?action=resend-otp     { email } | { phone }
+ * POST /api/auth?action=refresh        { refreshToken } — keep-alive ping
+ * POST /api/auth?action=logout         { refreshToken }
+ * GET  /api/auth?action=config         — returns Stripe publishable key
  */
-const bcrypt         = require('bcryptjs');
-const { query }      = require('../lib/db');
-const { signToken, verifyToken } = require('../lib/auth');
-const { handleCors } = require('../lib/cors');
-const { ok, badRequest, unauthorised, serverError, wrap } = require('../lib/respond');
 
-module.exports = wrap(async (req, res) => {
+var authLib    = require('../lib/auth');
+var { pool }   = require('../lib/db');
+var { handleCors } = require('../lib/cors');
+
+module.exports = async function(req, res) {
   if (handleCors(req, res)) return;
-  if (req.method !== 'POST') return res.status(405).json({ message: 'Method not allowed.' });
 
-  const action = req.query && req.query.action || req.body && req.body.action;
+  var action = (req.query && req.query.action) || (req.body && req.body.action) || '';
 
-  if (action === 'login')          return handleLogin(req, res);
-  if (action === 'register')       return handleRegister(req, res);
-  if (action === 'send-login-otp') return handleSendOtp(req, res);
-  if (action === 'login-otp')      return handleVerifyLoginOtp(req, res);
-  if (action === 'verify-otp')     return handleVerifyOtp(req, res);
-  if (action === 'resend-otp')     return handleResendOtp(req, res);
-  if (action === 'refresh')        return handleRefresh(req, res);
-  if (action === 'logout')         return ok(res, { ok: true });
+  // config is GET only
+  if (action === 'config') return handleConfig(req, res);
 
-  return badRequest(res, 'Unknown action: "' + action + '"');
-});
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-// ── Login ─────────────────────────────────────────────────────────────────────
-async function handleLogin(req, res) {
-  const body     = req.body || {};
-  const email    = body.email || '';
-  const password = body.password || '';
-
-  if (!email || !password) return badRequest(res, 'Email and password are required.');
-
-  let rows;
   try {
-    const result = await query(
-      'SELECT id,email,name,password_hash,currency,credits FROM users WHERE lower(email)=lower($1) LIMIT 1',
-      [email]
+    if (action === 'login')          return await handleLogin(req, res);
+    if (action === 'register')       return await handleRegister(req, res);
+    if (action === 'send-login-otp') return await handleSendOtp(req, res);
+    if (action === 'login-otp')      return await handleLoginOtp(req, res);
+    if (action === 'verify-otp')     return await handleVerifyOtp(req, res);
+    if (action === 'resend-otp')     return await handleResendOtp(req, res);
+    if (action === 'refresh')        return await handleRefresh(req, res);
+    if (action === 'logout')         return await handleLogout(req, res);
+    return res.status(400).json({ error: 'Unknown action: ' + action });
+  } catch (err) {
+    console.error('[Auth] Unhandled error:', err);
+    return res.status(500).json({ error: 'An unexpected error occurred.' });
+  }
+};
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+
+async function storeOtp(client, identifier, otp) {
+  try {
+    await client.query(
+      "INSERT INTO otp_codes (identifier, code, expires_at) VALUES ($1, $2, NOW() + INTERVAL '10 minutes') " +
+      "ON CONFLICT (identifier) DO UPDATE SET code = $2, expires_at = NOW() + INTERVAL '10 minutes'",
+      [identifier, otp]
     );
-    rows = result.rows;
-  } catch (err) { return serverError(res, err); }
-
-  const user = rows[0];
-  if (!user) return unauthorised(res, 'Invalid email or password.');
-
-  const match = await bcrypt.compare(password, user.password_hash);
-  if (!match)  return unauthorised(res, 'Invalid email or password.');
-
-  const token = signToken({ id: user.id, email: user.email });
-  console.log('[Auth] Login:', user.email);
-
-  return ok(res, {
-    accessToken: token,
-    user: {
-      id:       user.id,
-      name:     user.name,
-      email:    user.email,
-      currency: user.currency || 'USD',
-      flyybId:  'FLY' + String(user.id).padStart(6, '0'),
-    },
-    credits: parseFloat(user.credits) || 0,
-  });
+  } catch (e) {
+    console.error('StoreOtp:', e);
+  }
 }
 
-// ── Register ──────────────────────────────────────────────────────────────────
-async function handleRegister(req, res) {
-  const body     = req.body || {};
-  const name     = body.name || '';
-  const email    = (body.email || '').toLowerCase();
-  const phone    = body.phone || '';
-  const dial     = body.dial || '';
-  const currency = body.currency || 'USD';
-  const provider = body.provider || 'email';
-  const password = body.password || '';
+async function checkAndDeleteOtp(client, identifier, otp) {
+  var r = await client.query(
+    'SELECT id FROM otp_codes WHERE identifier = $1 AND code = $2 AND expires_at > NOW()',
+    [identifier, otp]
+  );
+  if (!r.rows.length) return false;
+  await client.query('DELETE FROM otp_codes WHERE identifier = $1', [identifier]).catch(function() {});
+  return true;
+}
 
+async function getCredits(client, userId) {
+  try {
+    var cr = await client.query('SELECT balance FROM credits WHERE user_id = $1', [userId]);
+    return parseFloat((cr.rows[0] && cr.rows[0].balance) || 0);
+  } catch (e) {
+    return 0;
+  }
+}
+
+function buildUserResponse(u) {
+  return {
+    id:           u.id,
+    name:         u.name || (u.email || '').split('@')[0],
+    email:        u.email || null,
+    phone:        u.phone || null,
+    flyybId:      u.flyyb_id || ('FLY' + String(u.id).padStart(6, '0')),
+    currency:     u.default_currency || 'USD',
+    emailVerified: !!u.email_verified,
+  };
+}
+
+// ─── Login ─────────────────────────────────────────────────────────────────────
+async function handleLogin(req, res) {
+  var b = req.body || {};
+  if (!b.password) return res.status(400).json({ error: 'Password required' });
+  if (!b.email && !b.phone) return res.status(400).json({ error: 'Email or phone required' });
+
+  var client, u;
+  try {
+    client = await pool.connect();
+    var qr;
+    if (b.email) {
+      qr = await client.query(
+        'SELECT id,name,email,phone,password_hash,is_active,email_verified,flyyb_id,default_currency FROM users WHERE lower(email)=lower($1)',
+        [b.email]
+      );
+    } else {
+      qr = await client.query(
+        'SELECT id,name,email,phone,password_hash,is_active,email_verified,flyyb_id,default_currency FROM users WHERE phone=$1',
+        [b.phone]
+      );
+    }
+    u = qr.rows[0];
+    if (!u || !u.password_hash) return res.status(401).json({ error: 'Invalid credentials' });
+    if (u.is_active === false)  return res.status(403).json({ error: 'Account is disabled' });
+
+    var valid = await authLib.verifyPassword(b.password, u.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    var at  = authLib.signAccessToken(u);
+    var rt  = authLib.generateRefreshToken();
+    var rh  = await authLib.hashToken(rt);
+    var exp = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    await client.query('UPDATE refresh_tokens SET revoked=TRUE WHERE user_id=$1', [u.id]);
+    await client.query(
+      'INSERT INTO refresh_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,$3)',
+      [u.id, rh, exp]
+    );
+
+    var credits = await getCredits(client, u.id);
+
+    res.json({
+      user:         buildUserResponse(u),
+      accessToken:  at,
+      refreshToken: rt,
+      expiresIn:    3600,
+      credits:      credits,
+    });
+  } catch (err) {
+    console.error('Login:', err);
+    res.status(500).json({ error: 'Login failed' });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+// ─── Register ──────────────────────────────────────────────────────────────────
+async function handleRegister(req, res) {
+  var b        = req.body || {};
+  var name     = (b.name || '').trim();
+  var email    = (b.email || '').trim().toLowerCase();
+  var phone    = b.phone ? ((b.dial || '') + b.phone) : '';
+  var currency = b.currency || 'USD';
+  var provider = b.provider || 'email';
+  var password = b.password || '';
+
+  if (!name) return res.status(400).json({ error: 'Name is required' });
   if (provider === 'email') {
-    if (!name || !email || !password) return badRequest(res, 'Name, email and password are required.');
-    if (password.length < 8 && !body._enc) return badRequest(res, 'Password must be at least 8 characters.');
+    if (!email)    return res.status(400).json({ error: 'Email is required' });
+    if (!password) return res.status(400).json({ error: 'Password is required' });
+    // Skip length check if frontend encrypted the password (_enc flag)
+    if (!b._enc && password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   } else {
-    if (!name || !phone) return badRequest(res, 'Name and phone are required.');
+    if (!phone) return res.status(400).json({ error: 'Phone is required' });
   }
 
-  const identifier = email || (dial + phone);
-
-  let existing;
+  var client;
   try {
-    const result = await query(
-      'SELECT id FROM users WHERE lower(email)=$1 OR phone=$2',
-      [email, phone ? (dial + phone) : '']
-    );
-    existing = result.rows;
-  } catch (err) { return serverError(res, err); }
+    client = await pool.connect();
 
-  if (existing.length) return badRequest(res, 'An account with this email/phone already exists.');
+    if (email) {
+      var ck = await client.query('SELECT id FROM users WHERE lower(email)=$1', [email]);
+      if (ck.rows.length) return res.status(409).json({ error: 'Email already registered' });
+    }
 
-  let newUser;
-  try {
+    var newUser;
     if (provider === 'email') {
-      const hash        = await bcrypt.hash(password, 12);
-      const result      = await query(
-        'INSERT INTO users (name,email,password_hash,currency,credits,email_verified) VALUES ($1,$2,$3,$4,0,false) RETURNING id,name,email,currency',
+      var hash = await authLib.hashPassword(password);
+      var ins  = await client.query(
+        'INSERT INTO users (name,email,password_hash,default_currency,is_active,email_verified,created_at) VALUES ($1,$2,$3,$4,TRUE,FALSE,NOW()) RETURNING id,name,email,flyyb_id,default_currency',
         [name, email, hash, currency]
       );
-      newUser = result.rows[0];
+      newUser = ins.rows[0];
     } else {
-      const result = await query(
-        'INSERT INTO users (name,phone,currency,credits) VALUES ($1,$2,$3,0) RETURNING id,name,phone,currency',
-        [name, dial + phone, currency]
+      var ins2 = await client.query(
+        'INSERT INTO users (name,phone,default_currency,is_active,email_verified,created_at) VALUES ($1,$2,$3,TRUE,FALSE,NOW()) RETURNING id,name,phone,flyyb_id,default_currency',
+        [name, phone, currency]
       );
-      newUser = result.rows[0];
+      newUser = ins2.rows[0];
     }
-  } catch (err) { return serverError(res, err); }
 
-  // Store OTP
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  try {
-    await query(
-      "INSERT INTO otp_codes (identifier,code,expires_at) VALUES ($1,$2,NOW()+INTERVAL '10 minutes') ON CONFLICT (identifier) DO UPDATE SET code=$2,expires_at=NOW()+INTERVAL '10 minutes'",
-      [identifier, otp]
-    );
-  } catch (e) { console.warn('[Auth] OTP insert warning:', e.message); }
+    // Initialise credits row
+    await client.query(
+      'INSERT INTO credits (user_id,balance) VALUES ($1,0) ON CONFLICT (user_id) DO NOTHING',
+      [newUser.id]
+    ).catch(function() {});
 
-  console.log('[Auth] Register:', identifier, '| OTP (demo):', otp);
-  return ok(res, { registered: true, requiresOtp: true });
+    // Store OTP for verification
+    var identifier = email || phone;
+    var otp = String(Math.floor(100000 + Math.random() * 900000));
+    await storeOtp(client, identifier, otp);
+    console.log('[Auth] Register OTP for', identifier, ':', otp, '(demo — wire to SMS/email in prod)');
+
+    res.json({ registered: true, requiresOtp: true });
+  } catch (err) {
+    console.error('Register:', err);
+    res.status(500).json({ error: 'Registration failed' });
+  } finally {
+    if (client) client.release();
+  }
 }
 
-// ── Verify OTP (email registration) ──────────────────────────────────────────
+// ─── Verify OTP (email registration) ──────────────────────────────────────────
 async function handleVerifyOtp(req, res) {
-  const body       = req.body || {};
-  const email      = (body.email || '').toLowerCase();
-  const identifier = email || body.phone || '';
-  const otp        = body.otp || '';
+  var b          = req.body || {};
+  var email      = (b.email || '').toLowerCase();
+  var identifier = email || b.phone || '';
+  var otp        = b.otp || '';
 
-  if (!identifier || !otp) return badRequest(res, 'Email/phone and OTP are required.');
+  if (!identifier || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
-  let rows;
+  var client, u;
   try {
-    const result = await query(
-      'SELECT * FROM otp_codes WHERE identifier=$1 AND code=$2 AND expires_at>NOW()',
-      [identifier, otp]
-    );
-    rows = result.rows;
-  } catch (err) { return serverError(res, err); }
+    client = await pool.connect();
+    var valid = await checkAndDeleteOtp(client, identifier, otp);
+    if (!valid) return res.status(401).json({ error: 'Invalid or expired OTP' });
 
-  if (!rows.length) return unauthorised(res, 'Invalid or expired OTP.');
-
-  await query('DELETE FROM otp_codes WHERE identifier=$1', [identifier]).catch(function() {});
-
-  let user;
-  try {
+    // Mark email verified and fetch user
     if (email) {
-      await query('UPDATE users SET email_verified=true WHERE lower(email)=$1', [email]);
-      const result = await query(
-        'SELECT id,name,email,currency,credits FROM users WHERE lower(email)=$1',
+      await client.query('UPDATE users SET email_verified=TRUE WHERE lower(email)=$1', [email]).catch(function() {});
+      var qr = await client.query(
+        'SELECT id,name,email,phone,is_active,email_verified,flyyb_id,default_currency FROM users WHERE lower(email)=$1',
         [email]
       );
-      user = result.rows[0];
+      u = qr.rows[0];
     }
-  } catch (err) { return serverError(res, err); }
 
-  if (!user) return serverError(res, new Error('User not found after OTP verify'));
+    if (!u) return res.status(500).json({ error: 'User not found after OTP verify' });
 
-  const token = signToken({ id: user.id, email: user.email });
-  console.log('[Auth] OTP verified:', identifier);
+    var at  = authLib.signAccessToken(u);
+    var rt  = authLib.generateRefreshToken();
+    var rh  = await authLib.hashToken(rt);
+    var exp = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await client.query(
+      'INSERT INTO refresh_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,$3)',
+      [u.id, rh, exp]
+    ).catch(function(e) { console.error('RT insert:', e); });
 
-  return ok(res, {
-    accessToken: token,
-    user: {
-      id:       user.id,
-      name:     user.name,
-      email:    user.email,
-      currency: user.currency || 'USD',
-      flyybId:  'FLY' + String(user.id).padStart(6, '0'),
-    },
-    credits: parseFloat(user.credits) || 0,
-  });
-}
+    var credits = await getCredits(client, u.id);
 
-// ── Send OTP (phone login) ────────────────────────────────────────────────────
-async function handleSendOtp(req, res) {
-  const body  = req.body || {};
-  const phone = body.phone || '';
-  if (!phone) return badRequest(res, 'Phone number is required.');
-
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  try {
-    await query(
-      "INSERT INTO otp_codes (identifier,code,expires_at) VALUES ($1,$2,NOW()+INTERVAL '10 minutes') ON CONFLICT (identifier) DO UPDATE SET code=$2,expires_at=NOW()+INTERVAL '10 minutes'",
-      [phone, otp]
-    );
-  } catch (err) { return serverError(res, err); }
-
-  console.log('[Auth] Phone OTP for', phone, ':', otp, '(demo — send via SMS in production)');
-  return ok(res, { sent: true });
-}
-
-// ── Verify OTP (phone login) ──────────────────────────────────────────────────
-async function handleVerifyLoginOtp(req, res) {
-  const body  = req.body || {};
-  const phone = body.phone || '';
-  const otp   = body.otp || '';
-  if (!phone || !otp) return badRequest(res, 'Phone and OTP are required.');
-
-  let rows;
-  try {
-    const result = await query(
-      'SELECT * FROM otp_codes WHERE identifier=$1 AND code=$2 AND expires_at>NOW()',
-      [phone, otp]
-    );
-    rows = result.rows;
-  } catch (err) { return serverError(res, err); }
-
-  if (!rows.length) return unauthorised(res, 'Invalid or expired OTP.');
-  await query('DELETE FROM otp_codes WHERE identifier=$1', [phone]).catch(function() {});
-
-  let user;
-  try {
-    const existing = await query('SELECT * FROM users WHERE phone=$1', [phone]);
-    if (existing.rows.length) {
-      user = existing.rows[0];
-    } else {
-      const created = await query('INSERT INTO users (phone,credits) VALUES ($1,0) RETURNING *', [phone]);
-      user = created.rows[0];
-    }
-  } catch (err) { return serverError(res, err); }
-
-  const token = signToken({ id: user.id, email: user.email || phone });
-  return ok(res, {
-    accessToken: token,
-    user: {
-      id:       user.id,
-      name:     user.name || phone,
-      email:    user.email,
-      currency: user.currency || 'USD',
-      flyybId:  'FLY' + String(user.id).padStart(6, '0'),
-    },
-    credits: parseFloat(user.credits) || 0,
-  });
-}
-
-// ── Resend OTP ────────────────────────────────────────────────────────────────
-async function handleResendOtp(req, res) {
-  const body       = req.body || {};
-  const identifier = body.email ? (body.email || '').toLowerCase() : (body.phone || '');
-  if (!identifier) return badRequest(res, 'Email or phone required.');
-
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  try {
-    await query(
-      "INSERT INTO otp_codes (identifier,code,expires_at) VALUES ($1,$2,NOW()+INTERVAL '10 minutes') ON CONFLICT (identifier) DO UPDATE SET code=$2,expires_at=NOW()+INTERVAL '10 minutes'",
-      [identifier, otp]
-    );
-  } catch (err) { return serverError(res, err); }
-
-  console.log('[Auth] Resend OTP for', identifier, ':', otp, '(demo)');
-  return ok(res, { sent: true });
-}
-
-// ── Refresh (keep-alive ping from frontend every 6 min while user is active) ──
-async function handleRefresh(req, res) {
-  const header = req.headers['authorization'] || '';
-  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return ok(res, { ok: true });
-
-  try {
-    const payload  = verifyToken(token);
-    const newToken = signToken({ id: payload.id, email: payload.email });
-    return ok(res, { accessToken: newToken });
-  } catch (e) {
-    // Token expired — return 200 silently (frontend handles expiry separately)
-    return ok(res, { ok: true });
+    res.json({
+      user:         buildUserResponse(u),
+      accessToken:  at,
+      refreshToken: rt,
+      expiresIn:    3600,
+      credits:      credits,
+    });
+  } catch (err) {
+    console.error('VerifyOtp:', err);
+    res.status(500).json({ error: 'Verification failed' });
+  } finally {
+    if (client) client.release();
   }
+}
+
+// ─── Send OTP (phone login) ────────────────────────────────────────────────────
+async function handleSendOtp(req, res) {
+  var b     = req.body || {};
+  var phone = b.phone || '';
+  if (!phone) return res.status(400).json({ error: 'Phone required' });
+
+  var otp = String(Math.floor(100000 + Math.random() * 900000));
+  var client;
+  try {
+    client = await pool.connect();
+    await storeOtp(client, phone, otp);
+    console.log('[Auth] Phone OTP for', phone, ':', otp, '(demo)');
+    res.json({ sent: true });
+  } catch (err) {
+    console.error('SendOtp:', err);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+// ─── Login with OTP (phone) ────────────────────────────────────────────────────
+async function handleLoginOtp(req, res) {
+  var b     = req.body || {};
+  var phone = b.phone || '';
+  var otp   = b.otp   || '';
+  if (!phone || !otp) return res.status(400).json({ error: 'Phone and OTP required' });
+
+  var client, u;
+  try {
+    client = await pool.connect();
+    var valid = await checkAndDeleteOtp(client, phone, otp);
+    if (!valid) return res.status(401).json({ error: 'Invalid or expired OTP' });
+
+    var existing = await client.query(
+      'SELECT id,name,email,phone,is_active,email_verified,flyyb_id,default_currency FROM users WHERE phone=$1',
+      [phone]
+    );
+    if (existing.rows.length) {
+      u = existing.rows[0];
+    } else {
+      var ins = await client.query(
+        'INSERT INTO users (phone,is_active,email_verified,created_at) VALUES ($1,TRUE,FALSE,NOW()) RETURNING id,name,email,phone,is_active,email_verified,flyyb_id,default_currency',
+        [phone]
+      );
+      u = ins.rows[0];
+      await client.query('INSERT INTO credits (user_id,balance) VALUES ($1,0) ON CONFLICT (user_id) DO NOTHING', [u.id]).catch(function() {});
+    }
+
+    var at  = authLib.signAccessToken(u);
+    var rt  = authLib.generateRefreshToken();
+    var rh  = await authLib.hashToken(rt);
+    var exp = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await client.query('UPDATE refresh_tokens SET revoked=TRUE WHERE user_id=$1', [u.id]);
+    await client.query('INSERT INTO refresh_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,$3)', [u.id, rh, exp]);
+
+    var credits = await getCredits(client, u.id);
+
+    res.json({
+      user:         buildUserResponse(u),
+      accessToken:  at,
+      refreshToken: rt,
+      expiresIn:    3600,
+      credits:      credits,
+    });
+  } catch (err) {
+    console.error('LoginOtp:', err);
+    res.status(500).json({ error: 'OTP login failed' });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+// ─── Resend OTP ────────────────────────────────────────────────────────────────
+async function handleResendOtp(req, res) {
+  var b          = req.body || {};
+  var identifier = b.email ? (b.email || '').toLowerCase() : (b.phone || '');
+  if (!identifier) return res.status(400).json({ error: 'Email or phone required' });
+
+  var otp = String(Math.floor(100000 + Math.random() * 900000));
+  var client;
+  try {
+    client = await pool.connect();
+    await storeOtp(client, identifier, otp);
+    console.log('[Auth] Resend OTP for', identifier, ':', otp, '(demo)');
+    res.json({ sent: true });
+  } catch (err) {
+    console.error('ResendOtp:', err);
+    res.status(500).json({ error: 'Failed to resend OTP' });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+// ─── Refresh / keep-alive ──────────────────────────────────────────────────────
+// Called every 6 min by frontend while user is active.
+// Accepts either a refreshToken body (full rotation) or just a Bearer header (simple re-issue).
+async function handleRefresh(req, res) {
+  var b  = req.body || {};
+  var rt = b.refreshToken || '';
+
+  // Simple keep-alive ping: just re-issue the access token from the header
+  if (!rt) {
+    var header = req.headers['authorization'] || '';
+    var token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.json({ ok: true });
+    try {
+      var payload  = authLib.verifyAccessToken(token);
+      var newToken = authLib.signAccessToken({ id: payload.id, email: payload.email, name: payload.name });
+      return res.json({ accessToken: newToken });
+    } catch (e) {
+      return res.json({ ok: true }); // token expired — frontend handles separately
+    }
+  }
+
+  // Full refresh token rotation
+  var client;
+  try {
+    client = await pool.connect();
+    var rh = await authLib.hashToken(rt);
+    var r  = await client.query(
+      'SELECT * FROM refresh_tokens WHERE token_hash=$1 AND revoked=FALSE AND expires_at>NOW()',
+      [rh]
+    );
+    if (!r.rows.length) return res.status(401).json({ error: 'Invalid or expired refresh token' });
+
+    var userId = r.rows[0].user_id;
+    var uRes   = await client.query(
+      'SELECT id,name,email,phone,is_active,email_verified,flyyb_id,default_currency FROM users WHERE id=$1',
+      [userId]
+    );
+    var u = uRes.rows[0];
+    if (!u) return res.status(401).json({ error: 'User not found' });
+
+    // Rotate refresh token
+    var newRt  = authLib.generateRefreshToken();
+    var newRh  = await authLib.hashToken(newRt);
+    var exp    = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await client.query('UPDATE refresh_tokens SET revoked=TRUE WHERE token_hash=$1', [rh]);
+    await client.query('INSERT INTO refresh_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,$3)', [userId, newRh, exp]);
+
+    res.json({
+      accessToken:  authLib.signAccessToken(u),
+      refreshToken: newRt,
+      expiresIn:    3600,
+    });
+  } catch (err) {
+    console.error('Refresh:', err);
+    res.status(500).json({ error: 'Token refresh failed' });
+  } finally {
+    if (client) client.release();
+  }
+}
+
+// ─── Logout ────────────────────────────────────────────────────────────────────
+async function handleLogout(req, res) {
+  var b  = req.body || {};
+  var rt = b.refreshToken || '';
+  if (rt) {
+    var client;
+    try {
+      client = await pool.connect();
+      var rh = await authLib.hashToken(rt);
+      await client.query('UPDATE refresh_tokens SET revoked=TRUE WHERE token_hash=$1', [rh]);
+    } catch (e) {
+      console.error('Logout:', e);
+    } finally {
+      if (client) client.release();
+    }
+  }
+  res.json({ ok: true });
+}
+
+// ─── Config (Stripe publishable key) ──────────────────────────────────────────
+function handleConfig(req, res) {
+  var key = process.env.STRIPE_PUBLISHABLE_KEY;
+  if (!key) return res.status(500).json({ error: 'Stripe not configured' });
+  res.json({ stripeKey: key });
 }
