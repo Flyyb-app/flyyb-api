@@ -1,20 +1,20 @@
 /**
  * FLYYB API — api/trips.js
  *
- * GET  /api/trips                              — list user bookings
+ * GET  /api/trips                            — list user bookings
  * GET  /api/trips?status=confirmed|cancelled
- * POST /api/trips?action=cancel               { bookingRef }
- * POST /api/trips?action=reschedule-intent    { bookingRef, newDate, amount, originalPrice, newPrice }
- * POST /api/trips?action=reschedule           { bookingRef, newDate, paymentIntentId }
+ * POST /api/trips?action=cancel              { bookingRef }
+ * POST /api/trips?action=reschedule-intent   { bookingRef, newDate, amount, originalPrice, newPrice }
+ * POST /api/trips?action=reschedule          { bookingRef, newDate, paymentIntentId }
  */
 
 var Stripe     = require('stripe');
 var authLib    = require('../lib/auth');
+var authModule = require('./auth');        // for sendCancellationEmail, sendRescheduleEmail
 var { pool }   = require('../lib/db');
-var { handleCors } = require('../lib/cors');
 
 module.exports = async function(req, res) {
-  if (handleCors(req, res)) return;
+  if (authLib.cors(req, res)) return;
 
   var user = authLib.requireAuth(req, res);
   if (!user) return;
@@ -33,12 +33,11 @@ module.exports = async function(req, res) {
 async function listTrips(req, res, user) {
   var status = ((req.query && req.query.status) || '').replace(/[^a-z]/g, '');
   var where  = status ? "AND b.status = '" + status + "'" : '';
-
   var client;
   try {
     client = await pool.connect();
     var r = await client.query(
-      'SELECT b.booking_ref AS "bookingRef", b.status, b.total_amount AS total, b.cabin, ' +
+      'SELECT b.booking_ref AS "bookingRef", b.status, b.total_paid AS total, b.cabin, ' +
       'b.dep_date AS date, b.dep_time AS departure, b.arr_time AS arrival, ' +
       'b.origin_code AS origin, b.dest_code AS destination, ' +
       'b.airline_code AS airline, b.flight_number AS "flightNumber" ' +
@@ -46,7 +45,6 @@ async function listTrips(req, res, user) {
       ' ORDER BY b.created_at DESC LIMIT 50',
       [user.id]
     );
-
     var trips = r.rows.map(function(row) {
       return {
         bookingRef:  row.bookingRef,
@@ -61,7 +59,6 @@ async function listTrips(req, res, user) {
         flight:      { airline: { name: row.airline }, number: row.flightNumber },
       };
     });
-
     res.json(trips);
   } catch (err) {
     console.error('ListTrips:', err);
@@ -75,7 +72,6 @@ async function listTrips(req, res, user) {
 async function handlePost(req, res, user) {
   var action     = (req.query && req.query.action) || (req.body && req.body.action) || '';
   var bookingRef = (req.body && req.body.bookingRef) || '';
-
   if (action === 'cancel')            return await cancelTrip(req, res, user, bookingRef);
   if (action === 'reschedule-intent') return await createRescheduleIntent(req, res, user);
   if (action === 'reschedule')        return await confirmReschedule(req, res, user);
@@ -85,14 +81,11 @@ async function handlePost(req, res, user) {
 // ─── Cancel ────────────────────────────────────────────────────────────────────
 async function cancelTrip(req, res, user, ref) {
   if (!ref) return res.status(400).json({ error: 'bookingRef is required' });
-
-  var client, b;
+  var client;
   try {
     client = await pool.connect();
-    var r = await client.query(
-      'SELECT * FROM bookings WHERE booking_ref=$1 AND user_id=$2', [ref, user.id]
-    );
-    b = r.rows[0];
+    var r = await client.query('SELECT * FROM bookings WHERE booking_ref=$1 AND user_id=$2', [ref, user.id]);
+    var b = r.rows[0];
     if (!b) return res.status(404).json({ error: 'Booking not found' });
     if (b.status === 'cancelled') return res.status(400).json({ error: 'Already cancelled' });
 
@@ -101,11 +94,18 @@ async function cancelTrip(req, res, user, ref) {
 
     await client.query("UPDATE bookings SET status='cancelled',updated_at=NOW() WHERE booking_ref=$1", [ref]);
 
-    // Refund credits if any were used
+    // Refund credits used
     if (parseFloat(b.credits_used) > 0) {
-      await client.query(
-        'UPDATE credits SET balance=balance+$1 WHERE user_id=$2', [b.credits_used, user.id]
-      ).catch(function(){});
+      await client.query('UPDATE credits SET balance=balance+$1 WHERE user_id=$2', [b.credits_used, user.id]).catch(function(){});
+    }
+
+    // Send cancellation email
+    var uRes = await client.query('SELECT name,email,confirmation_email FROM users u JOIN bookings bk ON bk.user_id=u.id WHERE bk.booking_ref=$1', [ref]).catch(function(){ return { rows: [] }; });
+    var emailTo = (uRes.rows[0] && (uRes.rows[0].confirmation_email || uRes.rows[0].email)) || '';
+    var userName = (uRes.rows[0] && uRes.rows[0].name) || '';
+    if (emailTo) {
+      authModule.sendCancellationEmail(emailTo, userName, ref, b.origin_code, b.dest_code)
+        .catch(function(e) { console.error('Cancel email (non-fatal):', e.message); });
     }
 
     console.log('[Trips] Cancelled', ref, 'for user', user.id);
@@ -118,15 +118,12 @@ async function cancelTrip(req, res, user, ref) {
   }
 }
 
-// ─── Reschedule Step 1: create PaymentIntent ──────────────────────────────────
-// NEW: reschedule now requires payment (10% fee + price diff)
+// ─── Reschedule Step 1: PaymentIntent ──────────────────────────────────────────
 async function createRescheduleIntent(req, res, user) {
   var b             = req.body || {};
   var bookingRef    = b.bookingRef    || '';
   var newDate       = b.newDate       || '';
   var amount        = parseFloat(b.amount) || 0;
-  var originalPrice = parseFloat(b.originalPrice) || 0;
-  var newPrice      = parseFloat(b.newPrice) || 0;
 
   if (!bookingRef) return res.status(400).json({ error: 'bookingRef is required' });
   if (!newDate)    return res.status(400).json({ error: 'newDate is required' });
@@ -139,9 +136,7 @@ async function createRescheduleIntent(req, res, user) {
   var client;
   try {
     client = await pool.connect();
-    var r = await client.query(
-      'SELECT * FROM bookings WHERE booking_ref=$1 AND user_id=$2', [bookingRef, user.id]
-    );
+    var r = await client.query('SELECT * FROM bookings WHERE booking_ref=$1 AND user_id=$2', [bookingRef, user.id]);
     var booking = r.rows[0];
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
     if (booking.status === 'cancelled')   return res.status(400).json({ error: 'Cannot reschedule a cancelled booking' });
@@ -157,7 +152,7 @@ async function createRescheduleIntent(req, res, user) {
     var email = uRes.rows[0] && uRes.rows[0].email;
 
     var intent = await stripe.paymentIntents.create({
-      amount:        Math.round(amount),   // already in cents from frontend
+      amount:        Math.round(amount),
       currency:      'usd',
       receipt_email: email || undefined,
       description:   'FLYYB reschedule fee — ' + bookingRef + ' to ' + newDate,
@@ -203,24 +198,28 @@ async function confirmReschedule(req, res, user) {
   var client;
   try {
     client = await pool.connect();
-    var r = await client.query(
-      'SELECT * FROM bookings WHERE booking_ref=$1 AND user_id=$2', [bookingRef, user.id]
-    );
+    var r = await client.query('SELECT * FROM bookings WHERE booking_ref=$1 AND user_id=$2', [bookingRef, user.id]);
     var booking = r.rows[0];
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
     if (booking.status === 'cancelled')   return res.status(400).json({ error: 'Cannot reschedule a cancelled booking' });
     if (booking.status === 'rescheduled') return res.status(400).json({ error: 'Already rescheduled' });
 
-    await client.query(
-      "UPDATE bookings SET status='rescheduled',dep_date=$1,updated_at=NOW() WHERE booking_ref=$2",
-      [newDate, bookingRef]
-    );
+    await client.query("UPDATE bookings SET status='rescheduled',dep_date=$1,updated_at=NOW() WHERE booking_ref=$2", [newDate, bookingRef]);
 
-    // Log reschedule fee in credit_transactions
+    // Log reschedule fee
     await client.query(
-      'INSERT INTO credit_transactions (user_id,description,amount,type,created_at) VALUES ($1,$2,$3,$4,NOW())',
-      [user.id, 'Reschedule fee ' + bookingRef + ' to ' + newDate, -(intent.amount/100), 'reschedule_fee']
+      "INSERT INTO credit_transactions (user_id,description,amount,type,created_at) VALUES ($1,$2,$3,'reschedule_fee',NOW())",
+      [user.id, 'Reschedule fee ' + bookingRef + ' to ' + newDate, -(intent.amount/100)]
     ).catch(function(){});
+
+    // Send reschedule confirmation email
+    var uRes = await client.query('SELECT name,email FROM users WHERE id=$1', [user.id]);
+    var uRow = uRes.rows[0] || {};
+    var emailTo = booking.confirmation_email || uRow.email || '';
+    if (emailTo) {
+      authModule.sendRescheduleEmail(emailTo, uRow.name, bookingRef, booking.origin_code, booking.dest_code, newDate)
+        .catch(function(e) { console.error('Reschedule email (non-fatal):', e.message); });
+    }
 
     console.log('[Trips] Rescheduled', bookingRef, 'to', newDate);
     res.json({ rescheduled: true, bookingRef: bookingRef, newDate: newDate });
