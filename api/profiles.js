@@ -1,269 +1,224 @@
-/**
- * FLYYB API — api/profiles.js
- *
- * GET  /api/profiles?action=get               — full profile + saved passengers
- * GET  /api/profiles?action=passengers        — saved passengers list
- * GET  /api/profiles?action=currencies        — currency list (public)
- * POST /api/profiles?action=update            { name }
- * POST /api/profiles?action=change-currency   { currency }
- * POST /api/profiles?action=change-password   { currentPassword, newPassword }
- * POST /api/profiles?action=passengers        { firstName, lastName, dob, passportNo, isPrimary }
- * DELETE /api/profiles?action=passengers&id=  — remove a passenger
- * POST /api/profiles?action=delete-account    { password }
- *
- * DB schema: users.default_currency, users.flyyb_id
- */
+var pg = require('pg');
+var authLib = require('../lib/auth');
+var pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-var authLib    = require('../lib/auth');
-var { pool }   = require('../lib/db');
-var { handleCors } = require('../lib/cors');
-
-var CURRENCIES_FALLBACK = [
-  {code:'USD',name:'US Dollar',symbol:'$'},{code:'EUR',name:'Euro',symbol:'€'},
-  {code:'GBP',name:'British Pound',symbol:'£'},{code:'INR',name:'Indian Rupee',symbol:'₹'},
-  {code:'AUD',name:'Australian Dollar',symbol:'A$'},{code:'CAD',name:'Canadian Dollar',symbol:'C$'},
-  {code:'SGD',name:'Singapore Dollar',symbol:'S$'},{code:'AED',name:'UAE Dirham',symbol:'AED'},
-  {code:'JPY',name:'Japanese Yen',symbol:'¥'},{code:'MYR',name:'Malaysian Ringgit',symbol:'RM'},
-  {code:'NZD',name:'New Zealand Dollar',symbol:'NZ$'},{code:'HKD',name:'Hong Kong Dollar',symbol:'HK$'},
-  {code:'CHF',name:'Swiss Franc',symbol:'CHF'},{code:'THB',name:'Thai Baht',symbol:'฿'},
-  {code:'QAR',name:'Qatari Riyal',symbol:'QAR'},{code:'SAR',name:'Saudi Riyal',symbol:'SAR'},
-  {code:'KRW',name:'South Korean Won',symbol:'₩'},{code:'PKR',name:'Pakistani Rupee',symbol:'₨'},
-  {code:'CNY',name:'Chinese Yuan',symbol:'¥'},{code:'IDR',name:'Indonesian Rupiah',symbol:'Rp'},
-];
-
-module.exports = async function(req, res) {
-  if (handleCors(req, res)) return;
-
-  var action = (req.query && req.query.action) || (req.body && req.body.action) || '';
-
-  // Currencies is public
-  if (action === 'currencies') return await getCurrencies(req, res);
-
-  var user = authLib.requireAuth(req, res);
-  if (!user) return;
-
-  try {
-    if (req.method === 'GET') {
-      if (action === 'passengers') return await getPassengers(req, res, user);
-      return await getProfile(req, res, user);
-    }
-    if (req.method === 'DELETE') {
-      if (action === 'passengers') return await deletePassenger(req, res, user);
-    }
-    if (req.method === 'POST') {
-      if (action === 'update')           return await updateProfile(req, res, user);
-      if (action === 'change-currency')  return await changeCurrency(req, res, user);
-      if (action === 'change-password')  return await changePassword(req, res, user);
-      if (action === 'passengers')       return await savePassenger(req, res, user);
-      if (action === 'delete-account')   return await deleteAccount(req, res, user);
-    }
-    return res.status(400).json({ error: 'Unknown action: ' + action });
-  } catch (err) {
-    console.error('[Profiles]', err);
-    res.status(500).json({ error: 'Request failed' });
-  }
-};
-
-// ─── Full profile ──────────────────────────────────────────────────────────────
-async function getProfile(req, res, user) {
+// ── GET PROFILE ───────────────────────────────────────────────
+async function handleGetProfile(req, res) {
+  var payload = authLib.requireAuth(req, res);
+  if (!payload) return;
   var client;
   try {
     client = await pool.connect();
-    var r = await client.query(
-      'SELECT id,name,email,phone,is_active,email_verified,flyyb_id,default_currency,created_at FROM users WHERE id=$1',
-      [user.id]
-    );
-    var u = r.rows[0];
-    if (!u) return res.status(404).json({ error: 'User not found' });
+    var [userRes, creditsRes, passRes] = await Promise.all([
+      client.query('SELECT u.id,u.name,u.email,u.phone,u.flyyb_id,u.default_currency,u.email_verified,u.auth_provider,u.created_at,c.balance FROM users u LEFT JOIN credits c ON c.user_id=u.id WHERE u.id=$1',[payload.sub]),
+      client.query('SELECT amount,type,description,booking_ref,created_at FROM credit_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10',[payload.sub]),
+      client.query('SELECT id,first_name,last_name,date_of_birth,nationality,passport_no,email,phone,is_primary FROM passenger_profiles WHERE user_id=$1 ORDER BY is_primary DESC,id ASC',[payload.sub])
+    ]);
+    var u = userRes.rows[0];
+    if (!u) return res.status(404).json({ error:'User not found' });
 
-    var credits = 0;
-    try {
-      var cr = await client.query('SELECT balance FROM credits WHERE user_id=$1', [u.id]);
-      credits = parseFloat((cr.rows[0] && cr.rows[0].balance) || 0);
-    } catch (e) {}
-
-    var passengers = await client.query(
-      'SELECT id,first_name,last_name,dob,passport_no,is_primary FROM passengers WHERE user_id=$1 ORDER BY is_primary DESC,id',
-      [u.id]
-    ).then(function(r2) { return r2.rows.map(safePassenger); }).catch(function() { return []; });
+    // Mask email and phone
+    var email = u.email||'';
+    var maskedEmail = email.length>3 ? email.slice(0,2)+'***'+email.slice(email.indexOf('@')) : '***';
+    var phone = u.phone||'';
+    var maskedPhone = phone.length>4 ? '****'+phone.slice(-4) : '****';
 
     res.json({
-      id:            u.id,
-      name:          u.name || (u.email || '').split('@')[0],
-      email:         u.email || null,
-      phone:         u.phone || null,
-      currency:      u.default_currency || 'USD',
-      credits:       credits,
-      emailVerified: !!u.email_verified,
-      flyybId:       u.flyyb_id || ('FLY' + String(u.id).padStart(6,'0')),
-      passengers:    passengers,
+      flyybId:       u.flyyb_id,
+      name:          u.name,
+      email:         maskedEmail,
+      emailFull:     email,
+      phone:         maskedPhone,
+      phoneFull:     phone,
+      currency:      u.default_currency,
+      emailVerified: u.email_verified,
+      provider:      u.auth_provider,
+      joined:        u.created_at,
+      credits: {
+        balance:      parseFloat(u.balance||0),
+        transactions: creditsRes.rows.map(function(t) {
+          return { amount:parseFloat(t.amount), type:t.type, description:t.description, bookingRef:t.booking_ref, date:t.created_at };
+        })
+      },
+      passengers: passRes.rows.map(function(p) {
+        return { id:p.id, firstName:p.first_name, lastName:p.last_name, dob:p.date_of_birth, nationality:p.nationality, passportNo:p.passport_no, email:p.email, phone:p.phone, isPrimary:p.is_primary };
+      })
     });
-  } catch (err) {
-    console.error('GetProfile:', err);
-    res.status(500).json({ error: 'Failed to load profile' });
-  } finally {
-    if (client) client.release();
-  }
+  } catch(err) {
+    console.error('Profile error:',err);
+    res.status(500).json({ error:'Failed to load profile' });
+  } finally { if(client) client.release(); }
 }
 
-function safePassenger(p) {
-  return {
-    id:         p.id,
-    firstName:  p.first_name  || '',
-    lastName:   p.last_name   || '',
-    dob:        p.dob         || null,
-    passportNo: p.passport_no || null,
-    isPrimary:  !!p.is_primary,
-  };
-}
-
-// ─── Passengers list ───────────────────────────────────────────────────────────
-async function getPassengers(req, res, user) {
+// ── UPDATE PROFILE ────────────────────────────────────────────
+async function handleUpdateProfile(req, res) {
+  var payload = authLib.requireAuth(req, res);
+  if (!payload) return;
+  var b = req.body || {};
   var client;
   try {
     client = await pool.connect();
-    var r = await client.query(
-      'SELECT id,first_name,last_name,dob,passport_no,is_primary FROM passengers WHERE user_id=$1 ORDER BY is_primary DESC,id',
-      [user.id]
-    );
-    res.json(r.rows.map(safePassenger));
-  } catch (err) {
-    console.error('GetPassengers:', err);
-    res.json([]); // non-fatal fallback
-  } finally {
-    if (client) client.release();
-  }
+    var updates = [], params = [], idx = 1;
+    if (b.name)  { updates.push('name=$'+idx); params.push(b.name.trim()); idx++; }
+    if (b.phone) { updates.push('phone=$'+idx); params.push(b.phone); idx++; }
+    if (!updates.length) return res.status(400).json({ error:'Nothing to update' });
+    params.push(payload.sub);
+    await client.query('UPDATE users SET '+updates.join(',')+', updated_at=NOW() WHERE id=$'+idx, params);
+    res.json({ message:'Profile updated' });
+  } catch(err) {
+    console.error('Update profile error:',err);
+    res.status(500).json({ error:'Update failed' });
+  } finally { if(client) client.release(); }
 }
 
-// ─── Currencies (public, with static fallback) ─────────────────────────────────
-async function getCurrencies(req, res) {
-  var client;
-  try {
-    client = await pool.connect();
-    var r = await client.query('SELECT code,name,symbol FROM currencies ORDER BY code');
-    if (r.rows.length) return res.json(r.rows);
-  } catch (e) {} finally {
-    if (client) client.release();
-  }
-  res.json(CURRENCIES_FALLBACK);
-}
+// ── CHANGE PASSWORD ───────────────────────────────────────────
+async function handleChangePassword(req, res) {
+  var payload = authLib.requireAuth(req, res);
+  if (!payload) return;
+  var b = req.body || {};
+  if (!b.currentPassword||!b.newPassword) return res.status(400).json({ error:'Current and new password required' });
+  if (b.newPassword.length<8) return res.status(400).json({ error:'New password must be at least 8 characters' });
 
-// ─── Update name ───────────────────────────────────────────────────────────────
-async function updateProfile(req, res, user) {
-  var name = ((req.body && req.body.name) || '').trim();
-  if (!name) return res.status(400).json({ error: 'Name is required' });
-  var client;
-  try {
-    client = await pool.connect();
-    await client.query('UPDATE users SET name=$1 WHERE id=$2', [name, user.id]);
-    res.json({ updated: true });
-  } catch (err) {
-    console.error('UpdateProfile:', err);
-    res.status(500).json({ error: 'Update failed' });
-  } finally {
-    if (client) client.release();
+  function isStrong(pw) {
+    var h=false,u=false,d=false;
+    for (var c of pw) { if(c>='a'&&c<='z')h=true; if(c>='A'&&c<='Z')u=true; if(c>='0'&&c<='9')d=true; }
+    return h&&u&&d;
   }
-}
-
-// ─── Change currency ───────────────────────────────────────────────────────────
-async function changeCurrency(req, res, user) {
-  var currency = (req.body && req.body.currency) || '';
-  if (!currency) return res.status(400).json({ error: 'currency is required' });
-  var client;
-  try {
-    client = await pool.connect();
-    await client.query('UPDATE users SET default_currency=$1 WHERE id=$2', [currency, user.id]);
-    res.json({ updated: true, currency: currency });
-  } catch (err) {
-    console.error('ChangeCurrency:', err);
-    res.status(500).json({ error: 'Update failed' });
-  } finally {
-    if (client) client.release();
-  }
-}
-
-// ─── Change password ───────────────────────────────────────────────────────────
-async function changePassword(req, res, user) {
-  var b         = req.body || {};
-  var currentPw = b.currentPassword || '';
-  var newPw     = b.newPassword     || '';
-  if (!currentPw || !newPw) return res.status(400).json({ error: 'Both passwords required' });
-  var client;
-  try {
-    client = await pool.connect();
-    var r  = await client.query('SELECT password_hash FROM users WHERE id=$1', [user.id]);
-    var u  = r.rows[0];
-    if (!u) return res.status(404).json({ error: 'User not found' });
-    var match = await authLib.verifyPassword(currentPw, u.password_hash);
-    if (!match) return res.status(401).json({ error: 'Current password is incorrect' });
-    var hash = await authLib.hashPassword(newPw);
-    await client.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, user.id]);
-    res.json({ updated: true });
-  } catch (err) {
-    console.error('ChangePassword:', err);
-    res.status(500).json({ error: 'Password update failed' });
-  } finally {
-    if (client) client.release();
-  }
-}
-
-// ─── Save passenger ────────────────────────────────────────────────────────────
-async function savePassenger(req, res, user) {
-  var b         = req.body || {};
-  var firstName  = b.firstName  || '';
-  var lastName   = b.lastName   || '';
-  var dob        = b.dob        || null;
-  var passportNo = b.passportNo || null;
-  var isPrimary  = !!b.isPrimary;
-  if (!firstName || !lastName) return res.status(400).json({ error: 'First and last name required' });
+  if (!isStrong(b.newPassword)) return res.status(400).json({ error:'Password needs uppercase, lowercase and a number' });
 
   var client;
   try {
     client = await pool.connect();
-    if (isPrimary) {
-      await client.query('UPDATE passengers SET is_primary=FALSE WHERE user_id=$1', [user.id]).catch(function(){});
+    var r = await client.query('SELECT password_hash FROM users WHERE id=$1',[payload.sub]);
+    var user = r.rows[0];
+    if (!user) return res.status(404).json({ error:'User not found' });
+    var valid = await authLib.verifyPassword(b.currentPassword, user.password_hash);
+    if (!valid) return res.status(401).json({ error:'Current password is incorrect' });
+    var newHash = await authLib.hashPassword(b.newPassword);
+    await client.query('UPDATE users SET password_hash=$1, updated_at=NOW() WHERE id=$2',[newHash,payload.sub]);
+    res.json({ message:'Password changed successfully' });
+  } catch(err) {
+    console.error('Change password error:',err);
+    res.status(500).json({ error:'Password change failed' });
+  } finally { if(client) client.release(); }
+}
+
+// ── CHANGE CURRENCY ───────────────────────────────────────────
+async function handleChangeCurrency(req, res) {
+  var payload = authLib.requireAuth(req, res);
+  if (!payload) return;
+  var b = req.body || {};
+  if (!b.currency||b.currency.length!==3) return res.status(400).json({ error:'Valid currency code required' });
+
+  var client;
+  try {
+    client = await pool.connect();
+    var curCheck = await client.query('SELECT code FROM currencies WHERE code=$1',[b.currency]);
+    if (!curCheck.rows.length) return res.status(400).json({ error:'Invalid currency' });
+
+    // Get current currency to check if different
+    var userRes = await client.query('SELECT default_currency FROM users WHERE id=$1',[payload.sub]);
+    var currentCurrency = userRes.rows[0]&&userRes.rows[0].default_currency;
+    if (currentCurrency!==b.currency) {
+      // Changing currency - note credits cannot be used in future until changed back
+      await client.query('UPDATE users SET default_currency=$1, updated_at=NOW() WHERE id=$2',[b.currency,payload.sub]);
+      res.json({ message:'Currency changed to '+b.currency, warning:'Note: Changing currency means existing credits cannot be redeemed until you change back to your original currency.' });
+    } else {
+      res.json({ message:'Currency is already '+b.currency });
     }
-    var r = await client.query(
-      'INSERT INTO passengers (user_id,first_name,last_name,dob,passport_no,is_primary) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
-      [user.id, firstName, lastName, dob, passportNo, isPrimary]
-    );
-    res.json({ saved: true, id: r.rows[0].id });
-  } catch (err) {
-    console.error('SavePassenger:', err);
-    res.status(500).json({ error: 'Failed to save passenger' });
-  } finally {
-    if (client) client.release();
-  }
+  } catch(err) {
+    console.error('Change currency error:',err);
+    res.status(500).json({ error:'Currency change failed' });
+  } finally { if(client) client.release(); }
 }
 
-// ─── Delete passenger ──────────────────────────────────────────────────────────
-async function deletePassenger(req, res, user) {
-  var id = (req.query && req.query.id) || (req.body && req.body.id);
-  if (!id) return res.status(400).json({ error: 'id is required' });
+// ── PASSENGERS CRUD ───────────────────────────────────────────
+async function handlePassengers(req, res) {
+  var payload = authLib.requireAuth(req, res);
+  if (!payload) return;
   var client;
   try {
     client = await pool.connect();
-    await client.query('DELETE FROM passengers WHERE id=$1 AND user_id=$2', [id, user.id]);
-    res.json({ deleted: true });
-  } catch (err) {
-    console.error('DeletePassenger:', err);
-    res.status(500).json({ error: 'Delete failed' });
-  } finally {
-    if (client) client.release();
-  }
+    if (req.method==='GET') {
+      var r = await client.query('SELECT id,first_name,last_name,date_of_birth,nationality,passport_no,passport_exp,email,phone,is_primary FROM passenger_profiles WHERE user_id=$1 ORDER BY is_primary DESC,id ASC',[payload.sub]);
+      return res.json(r.rows.map(function(p) {
+        return { id:p.id, firstName:p.first_name, lastName:p.last_name, dob:p.date_of_birth, nationality:p.nationality, passportNo:p.passport_no, passportExp:p.passport_exp, email:p.email, phone:p.phone, isPrimary:p.is_primary };
+      }));
+    }
+    if (req.method==='POST') {
+      var b = req.body||{};
+      if (!b.firstName||!b.lastName) throw { status:400, message:'First and last name required' };
+      if (b.isPrimary) await client.query('UPDATE passenger_profiles SET is_primary=FALSE WHERE user_id=$1',[payload.sub]);
+      var r = await client.query('INSERT INTO passenger_profiles (user_id,first_name,last_name,date_of_birth,nationality,passport_no,passport_exp,email,phone,is_primary) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id',[payload.sub,b.firstName,b.lastName,b.dob||null,b.nationality||null,b.passportNo||null,b.passportExp||null,b.email||null,b.phone||null,b.isPrimary||false]);
+      return res.status(201).json({ id:r.rows[0].id, message:'Passenger saved' });
+    }
+    if (req.method==='PUT') {
+      var b = req.body||{}, id=req.query.id;
+      if (!id) throw { status:400, message:'ID required' };
+      if (b.isPrimary) await client.query('UPDATE passenger_profiles SET is_primary=FALSE WHERE user_id=$1',[payload.sub]);
+      await client.query('UPDATE passenger_profiles SET first_name=$1,last_name=$2,date_of_birth=$3,nationality=$4,passport_no=$5,email=$6,phone=$7,is_primary=$8,updated_at=NOW() WHERE id=$9 AND user_id=$10',[b.firstName,b.lastName,b.dob||null,b.nationality||null,b.passportNo||null,b.email||null,b.phone||null,b.isPrimary||false,id,payload.sub]);
+      return res.json({ message:'Passenger updated' });
+    }
+    if (req.method==='DELETE') {
+      var id = req.query.id;
+      if (!id) throw { status:400, message:'ID required' };
+      var r = await client.query('DELETE FROM passenger_profiles WHERE id=$1 AND user_id=$2',[id,payload.sub]);
+      if (!r.rowCount) throw { status:404, message:'Not found' };
+      return res.json({ message:'Deleted' });
+    }
+    res.status(405).json({ error:'Method not allowed' });
+  } catch(err) {
+    if (err.status) return res.status(err.status).json({ error:err.message });
+    console.error('Passengers error:',err);
+    res.status(500).json({ error:'Operation failed' });
+  } finally { if(client) client.release(); }
 }
 
-// ─── Delete account ────────────────────────────────────────────────────────────
-async function deleteAccount(req, res, user) {
+// ── DELETE ACCOUNT ────────────────────────────────────────────
+async function handleDeleteAccount(req, res) {
+  var payload = authLib.requireAuth(req, res);
+  if (!payload) return;
+  var b = req.body||{};
+  if (!b.password) return res.status(400).json({ error:'Password required to delete account' });
   var client;
   try {
     client = await pool.connect();
-    await client.query('DELETE FROM users WHERE id=$1', [user.id]);
-    res.json({ deleted: true });
-  } catch (err) {
-    console.error('DeleteAccount:', err);
-    res.status(500).json({ error: 'Delete failed' });
-  } finally {
-    if (client) client.release();
+    var r = await client.query('SELECT password_hash FROM users WHERE id=$1',[payload.sub]);
+    if (!r.rows.length) return res.status(404).json({ error:'User not found' });
+    var valid = await authLib.verifyPassword(b.password, r.rows[0].password_hash);
+    if (!valid) return res.status(401).json({ error:'Incorrect password' });
+    // Soft delete
+    await client.query('UPDATE users SET is_active=FALSE, email=email||$1, updated_at=NOW() WHERE id=$2',['_deleted_'+Date.now(),payload.sub]);
+    await client.query('UPDATE refresh_tokens SET revoked=TRUE WHERE user_id=$1',[payload.sub]);
+    res.json({ message:'Account deleted successfully' });
+  } catch(err) {
+    console.error('Delete account error:',err);
+    res.status(500).json({ error:'Account deletion failed' });
+  } finally { if(client) client.release(); }
+}
+
+// ── CURRENCIES LIST ───────────────────────────────────────────
+async function handleCurrencies(req, res) {
+  try {
+    var client = await pool.connect();
+    var r = await client.query('SELECT code,name,symbol,rate_usd FROM currencies ORDER BY code');
+    client.release();
+    res.json(r.rows);
+  } catch(err) {
+    res.status(500).json({ error:'Failed to fetch currencies' });
   }
 }
+
+// ── ROUTER ────────────────────────────────────────────────────
+module.exports = function(req, res) {
+  if (authLib.cors(req, res)) return;
+  var action = req.query.action;
+  if (action==='currencies')       return handleCurrencies(req, res);
+  if (action==='get')              return handleGetProfile(req, res);
+  if (action==='update')           return handleUpdateProfile(req, res);
+  if (action==='change-password')  return handleChangePassword(req, res);
+  if (action==='change-currency')  return handleChangeCurrency(req, res);
+  if (action==='passengers')       return handlePassengers(req, res);
+  if (action==='delete-account')   return handleDeleteAccount(req, res);
+  return res.status(400).json({ error:'Missing action' });
+};

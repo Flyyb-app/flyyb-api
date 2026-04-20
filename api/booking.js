@@ -1,212 +1,218 @@
-/**
- * FLYYB API — api/booking.js
- *
- * GET  /api/booking?action=credits       — credits balance + history
- * GET  /api/booking?action=addons        — available add-ons
- * POST /api/booking?action=create-intent — Stripe PaymentIntent + pending booking
- *                                          Also: awards credits, sends confirmation email
- */
+var pg=require('pg'),Stripe=require('stripe'),auth=require('../lib/auth'),creditsLib=require('../lib/credits');
+var pool=new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false}});
 
-var Stripe     = require('stripe');
-var authLib    = require('../lib/auth');
-var authModule = require('./auth');         // for sendBookingEmail
-var { pool }   = require('../lib/db');
+async function sendEmail(to,subject,html){
+var k=process.env.BREVO_SMTP_KEY,f=process.env.BREVO_FROM_EMAIL;
+if(!k||!f){console.log('=== EMAIL (no keys) to '+to+' ===');return;}
+try{
+var r=await fetch('https://api.brevo.com/v3/smtp/email',{method:'POST',headers:{'Content-Type':'application/json','api-key':k},body:JSON.stringify({sender:{name:'FLYYB',email:f},to:[{email:to}],subject,htmlContent:html})});
+if(!r.ok){var e=await r.text();console.error('Brevo error:',e);}
+else console.log('Email sent to:',to);
+}catch(e){console.error('Email error:',e.message);}
+}
 
-module.exports = async function(req, res) {
-  if (authLib.cors(req, res)) return;
+function row(label,value){return '<div style="display:flex;justify-content:space-between;margin-bottom:10px"><span style="color:rgba(245,240,232,.5);font-size:13px">'+label+'</span><span>'+value+'</span></div>';}
 
-  var action = (req.query && req.query.action) || (req.body && req.body.action) || '';
+function confirmationHtml(b){
+var returnSection='';
+if(b.returnFlight&&b.returnFlight.origin){
+returnSection='<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0">'
++'<div style="font-size:11px;color:rgba(212,168,67,.7);letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px">Return Flight</div>'
++row('Route',b.returnFlight.origin+' to '+b.returnFlight.dest)
++row('Date',b.returnFlight.date)
++row('Flight',b.returnFlight.flight)
++row('Departure',b.returnFlight.dep)
++row('Arrival',b.returnFlight.arr);
+}
+return '<div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#0a0a0f;color:#f5f0e8;padding:32px;border-radius:8px">'
++'<h1 style="font-size:24px;letter-spacing:4px;margin-bottom:4px">FLY<span style="color:#d4a843">YB</span></h1>'
++'<p style="color:rgba(245,240,232,.5);font-size:12px;margin-bottom:28px">fly with vibe</p>'
++'<h2 style="color:#5daa72;font-size:20px;margin-bottom:8px">Booking Confirmed</h2>'
++'<p style="color:rgba(245,240,232,.7);font-size:14px;margin-bottom:24px">Your flight is confirmed! Here are your booking details.</p>'
++'<div style="background:rgba(255,255,255,.04);border:1px solid rgba(212,168,67,.2);border-radius:6px;padding:20px;margin-bottom:20px">'
++'<div style="text-align:center;margin-bottom:16px">'
++'<span style="font-family:monospace;font-size:22px;letter-spacing:4px;color:#d4a843">'+b.ref+'</span>'
++'<div style="font-size:11px;color:rgba(245,240,232,.4);margin-top:4px;letter-spacing:.15em">BOOKING REFERENCE</div></div>'
++'<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:16px 0">'
++'<div style="font-size:11px;color:rgba(212,168,67,.7);letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px">Outbound Flight</div>'
++row('Route',b.origin+' to '+b.dest)
++row('Date',b.date)
++row('Departure',b.dep)
++row('Arrival',b.arr)
++row('Flight',b.flight)
++row('Cabin',b.cabin)
++row('Passengers',b.adults)
++returnSection
++'<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:16px 0">'
++'<div style="display:flex;justify-content:space-between"><span style="color:rgba(245,240,232,.5);font-size:13px">Total Paid</span>'
++'<span style="color:#d4a843;font-weight:600;font-size:16px">$'+b.total+'</span></div>'
++(b.creditsEarned?'<div style="display:flex;justify-content:space-between;margin-top:8px"><span style="color:rgba(245,240,232,.5);font-size:13px">Credits Earned</span><span style="color:#5daa72">+$'+b.creditsEarned+'</span></div>':'')
++'</div>'
++'<p style="color:rgba(245,240,232,.4);font-size:12px;text-align:center">Thank you for booking with FLYYB. Visit flyyb.vercel.app to manage your trips.</p>'
++'</div>';
+}
 
-  try {
-    if (action === 'addons')        return await getAddons(req, res);
-    if (action === 'credits')       return await getCredits(req, res);
-    if (action === 'create-intent') return await createIntent(req, res);
-    return res.status(400).json({ error: 'Unknown action: ' + action });
-  } catch (err) {
-    console.error('[Booking]', err);
-    res.status(500).json({ error: 'Request failed' });
-  }
+async function handleAddons(req,res){
+var airline=req.query.airline||null;
+var client;
+try{
+client=await pool.connect();
+var r=await client.query('SELECT id,code,category,name,description,price_usd,icon,airline_code FROM addons_catalog WHERE is_active=TRUE AND (airline_code IS NULL OR airline_code=$1) ORDER BY category,price_usd',[airline]);
+var grouped=r.rows.reduce(function(acc,a){if(!acc[a.category])acc[a.category]=[];acc[a.category].push({id:a.id,code:a.code,name:a.name,description:a.description,price:parseFloat(a.price_usd),icon:a.icon,airlineOnly:a.airline_code});return acc;},{});
+res.json({addons:grouped});
+}catch(err){console.error('Addons:',err);res.status(500).json({error:'Failed to fetch add-ons'});}
+finally{if(client)client.release();}
+}
+
+async function handleCredits(req,res){
+var payload=auth.requireAuth(req,res);if(!payload)return;
+if(req.method!=='GET')return res.status(405).json({error:'Method not allowed'});
+var client;
+try{
+client=await pool.connect();
+var results=await Promise.all([
+client.query('SELECT balance FROM credits WHERE user_id=$1',[payload.sub]),
+client.query('SELECT amount,type,description,booking_ref,created_at FROM credit_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20',[payload.sub])
+]);
+var credit=results[0].rows[0];
+res.json({balance:parseFloat((credit&&credit.balance)||0),transactions:results[1].rows.map(function(t){return{amount:parseFloat(t.amount),type:t.type,description:t.description,bookingRef:t.booking_ref,date:t.created_at};})});
+}catch(err){console.error('Credits:',err);res.status(500).json({error:'Failed to fetch credits'});}
+finally{if(client)client.release();}
+}
+
+async function handleCreateIntent(req,res){
+var payload=auth.requireAuth(req,res);if(!payload)return;
+var b=req.body||{};
+if(!b.flightNumber||!b.originCode||!b.destCode||!b.depDate||!b.baseAmount)return res.status(400).json({error:'Missing required fields'});
+var stripe=Stripe(process.env.STRIPE_SECRET_KEY);
+var addons=b.addons||[],passengers=b.passengers||[];
+var addonsTotal=addons.reduce(function(s,a){return s+(a.price*(a.quantity||1));},0);
+var subtotal=parseFloat(b.baseAmount)+addonsTotal;
+var creditsApplied=Math.min(b.creditsToUse||0,creditsLib.calculateMaxRedeemable(subtotal));
+var totalCharge=Math.max(0,subtotal-creditsApplied);
+var bookingRef='FLY'+Date.now().toString(36).toUpperCase()+Math.random().toString(36).substr(2,3).toUpperCase();
+var confEmail=b.confirmationEmail||null;
+var rt=b.returnFlight||null;
+var client,bookingId;
+try{
+client=await pool.connect();
+if(creditsApplied>0){var cr=await client.query('SELECT balance FROM credits WHERE user_id=$1',[payload.sub]);if(parseFloat((cr.rows[0]&&cr.rows[0].balance)||0)<creditsApplied)throw{status:400,message:'Insufficient credit balance'};}
+var br=await client.query('INSERT INTO bookings (booking_ref,user_id,flight_number,airline_code,origin_code,dest_code,dep_date,dep_time,arr_time,cabin,adults,base_amount,credits_used,total_amount,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id',[bookingRef,payload.sub,b.flightNumber.slice(0,20),b.airlineCode,b.originCode,b.destCode,b.depDate,b.depTime,b.arrTime,b.cabin,b.adults||1,subtotal,creditsApplied,totalCharge,'pending']);
+bookingId=br.rows[0].id;
+await Promise.all(
+passengers.map(function(p){return client.query('INSERT INTO booking_passengers (booking_id,first_name,last_name,date_of_birth,passport_no,seat_number) VALUES ($1,$2,$3,$4,$5,$6)',[bookingId,p.firstName,p.lastName,p.dob||null,p.passportNo||null,p.seat||null]);})
+.concat(addons.map(function(a){
+var cleanCode=a.code.replace(/^(out_|ret_)/,'');
+return client.query('SELECT id,price_usd FROM addons_catalog WHERE code=$1',[cleanCode]).then(function(r){if(r.rows[0]){var qty=a.quantity||1;return client.query('INSERT INTO booking_addons (booking_id,addon_id,quantity,unit_price,total_price) VALUES ($1,$2,$3,$4,$5)',[bookingId,r.rows[0].id,qty,r.rows[0].price_usd,r.rows[0].price_usd*qty]);}});
+}))
+);
+var pi=await stripe.paymentIntents.create({
+amount:Math.round(totalCharge*100),
+currency:'usd',
+metadata:{
+bookingId:bookingId.toString(),
+bookingRef,
+userId:payload.sub.toString(),
+flightNumber:b.flightNumber,
+confEmail:confEmail||'',
+retOriginCode:rt?rt.originCode:'',
+retDestCode:rt?rt.destCode:'',
+retDepDate:rt?rt.depDate:'',
+retFlight:rt?rt.flightNumber:'',
+retDep:rt?rt.depTime:'',
+retArr:rt?rt.arrTime:''
+},
+description:'FLYYB '+bookingRef+' '+b.originCode+'->'+b.destCode
+});
+await client.query('INSERT INTO payment_intents (booking_id,stripe_pi_id,amount,credits_applied,status) VALUES ($1,$2,$3,$4,$5)',[bookingId,pi.id,totalCharge,creditsApplied,'pending']);
+res.json({clientSecret:pi.client_secret,bookingRef,bookingId,summary:{baseAmount:parseFloat(b.baseAmount),addonsTotal,subtotal,creditsApplied,totalCharge,creditsToEarn:creditsLib.calculateEarnable(totalCharge)}});
+}catch(err){if(err.status)return res.status(err.status).json({error:err.message});console.error('Intent:',err);res.status(500).json({error:err.message||'Payment setup failed'});}
+finally{if(client)client.release();}
+}
+
+function getRawBody(req){return new Promise(function(resolve,reject){var d='';req.on('data',function(c){d+=c;});req.on('end',function(){resolve(d);});req.on('error',reject);});}
+
+async function handleWebhook(req,res){
+var stripe=Stripe(process.env.STRIPE_SECRET_KEY);
+try{
+var raw=await getRawBody(req);
+var event=stripe.webhooks.constructEvent(raw,req.headers['stripe-signature'],process.env.STRIPE_WEBHOOK_SECRET);
+var client=await pool.connect();
+try{
+if(event.type==='payment_intent.succeeded'){
+var pi=event.data.object;
+var bookingId=parseInt(pi.metadata.bookingId);
+var userId=parseInt(pi.metadata.userId);
+var bookingRef=pi.metadata.bookingRef;
+var confEmail=pi.metadata.confEmail||null;
+var retOriginCode=pi.metadata.retOriginCode||null;
+var retDestCode=pi.metadata.retDestCode||null;
+var retDepDate=pi.metadata.retDepDate||null;
+var retFlight=pi.metadata.retFlight||null;
+var retDep=pi.metadata.retDep||null;
+var retArr=pi.metadata.retArr||null;
+await client.query('BEGIN');
+var br=await client.query('UPDATE bookings SET status=$1,payment_ref=$2,payment_method=$3,updated_at=NOW() WHERE id=$4 RETURNING total_amount,credits_used,dep_date,dep_time,arr_time,flight_number,airline_code,origin_code,dest_code,cabin,adults',['confirmed',pi.id,'stripe',bookingId]);
+var bk=br.rows[0];
+await client.query('UPDATE payment_intents SET status=$1,updated_at=NOW() WHERE stripe_pi_id=$2',['succeeded',pi.id]);
+if(bk&&parseFloat(bk.credits_used)>0){
+await client.query('UPDATE credits SET balance=balance-$1,updated_at=NOW() WHERE user_id=$2',[bk.credits_used,userId]);
+await client.query('INSERT INTO credit_transactions (user_id,amount,type,description,booking_ref) VALUES ($1,$2,$3,$4,$5)',[userId,-bk.credits_used,'redeem','Credits applied to '+bookingRef,bookingRef]);
+}
+var earned=0;
+if(bk&&userId)earned=await creditsLib.earnCredits(client,userId,bookingRef,parseFloat(bk.total_amount));
+await client.query('COMMIT');
+if(bk){
+var emailTo=confEmail;
+if(!emailTo){var ur=await client.query('SELECT email FROM users WHERE id=$1',[userId]);emailTo=ur.rows[0]&&ur.rows[0].email;}
+if(emailTo){
+var oa=await client.query('SELECT city FROM airports WHERE iata_code=$1',[bk.origin_code]);
+var da=await client.query('SELECT city FROM airports WHERE iata_code=$1',[bk.dest_code]);
+// Build return flight section if exists
+var returnFlight=null;
+if(retOriginCode&&retDestCode){
+var roa=await client.query('SELECT city FROM airports WHERE iata_code=$1',[retOriginCode]);
+var rda=await client.query('SELECT city FROM airports WHERE iata_code=$1',[retDestCode]);
+returnFlight={
+origin:(roa.rows[0]&&roa.rows[0].city)||retOriginCode,
+dest:(rda.rows[0]&&rda.rows[0].city)||retDestCode,
+date:retDepDate?new Date(retDepDate).toDateString():'',
+flight:retFlight||'',
+dep:retDep?retDep.slice(0,5):'',
+arr:retArr?retArr.slice(0,5):''
 };
-
-// ─── Add-ons ───────────────────────────────────────────────────────────────────
-async function getAddons(req, res) {
-  res.json({
-    addons: {
-      baggage: [
-        { code:'bag_23', name:'Extra 23kg Bag',   description:'Additional checked baggage',  price:45, icon:'🧳' },
-        { code:'bag_32', name:'Extra 32kg Bag',   description:'Oversized checked baggage',   price:65, icon:'🧳' },
-      ],
-      seat: [
-        { code:'seat_xl',   name:'Extra Legroom', description:'Up to 6 inches extra legroom', price:35, icon:'💺' },
-        { code:'seat_exit', name:'Exit Row Seat', description:'Maximum space + priority exit', price:25, icon:'💺' },
-      ],
-      meal: [
-        { code:'meal_veg',   name:'Vegetarian Meal', description:'Fresh vegetarian option', price:12, icon:'🍽️' },
-        { code:'meal_vegan', name:'Vegan Meal',       description:'100% plant-based meal',  price:12, icon:'🍽️' },
-        { code:'meal_child', name:'Child Meal',       description:'Kid-friendly meal',      price:8,  icon:'🍽️' },
-      ],
-      kit: [
-        { code:'lounge',    name:'Airport Lounge', description:'Access to partner lounges', price:45, icon:'🎁' },
-        { code:'fasttrack', name:'Fast Track',     description:'Priority security lane',    price:15, icon:'🎁' },
-        { code:'wifi',      name:'In-flight WiFi', description:'High-speed internet',       price:18, icon:'🎁' },
-      ],
-    },
-  });
+}
+await sendEmail(emailTo,'Your FLYYB Booking is Confirmed - '+bookingRef,confirmationHtml({
+ref:bookingRef,
+origin:(oa.rows[0]&&oa.rows[0].city)||bk.origin_code,
+dest:(da.rows[0]&&da.rows[0].city)||bk.dest_code,
+date:new Date(bk.dep_date).toDateString(),
+dep:bk.dep_time?bk.dep_time.slice(0,5):'',
+arr:bk.arr_time?bk.arr_time.slice(0,5):'',
+flight:bk.flight_number,
+cabin:bk.cabin.charAt(0).toUpperCase()+bk.cabin.slice(1),
+adults:bk.adults,
+total:parseFloat(bk.total_amount).toFixed(2),
+creditsEarned:earned?parseFloat(earned).toFixed(2):null,
+returnFlight:returnFlight
+}));
+}else{console.log('No email for booking',bookingRef);}
+}
+}else if(event.type==='payment_intent.payment_failed'){
+await client.query('UPDATE bookings SET status=$1 WHERE id=$2',['payment_failed',parseInt(event.data.object.metadata.bookingId)]);
+}
+}finally{client.release();}
+res.json({received:true});
+}catch(err){console.error('Webhook:',err);res.status(400).json({error:err.message});}
 }
 
-// ─── Credits balance ───────────────────────────────────────────────────────────
-async function getCredits(req, res) {
-  var user = authLib.requireAuth(req, res);
-  if (!user) return;
-  var client;
-  try {
-    client = await pool.connect();
-    var cr = await client.query('SELECT balance FROM credits WHERE user_id=$1', [user.id]);
-    var tx = await client.query(
-      'SELECT description,amount,type,created_at AS date FROM credit_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20',
-      [user.id]
-    ).catch(function() { return { rows: [] }; });
-    res.json({ balance: parseFloat((cr.rows[0]&&cr.rows[0].balance)||0), transactions: tx.rows });
-  } catch (err) {
-    console.error('GetCredits:', err);
-    res.status(500).json({ error: 'Failed to load credits' });
-  } finally {
-    if (client) client.release();
-  }
-}
-
-// ─── Create PaymentIntent ──────────────────────────────────────────────────────
-async function createIntent(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
-  var user = authLib.requireAuth(req, res);
-  if (!user) return;
-
-  var b            = req.body || {};
-  var flightNumber = b.flightNumber  || '';
-  var airlineCode  = b.airlineCode   || '';
-  var originCode   = b.originCode    || '';
-  var destCode     = b.destCode      || '';
-  var depDate      = b.depDate       || '';
-  var depTime      = b.depTime       || '';
-  var arrTime      = b.arrTime       || '';
-  var cabin        = b.cabin         || 'economy';
-  var adults       = parseInt(b.adults) || 1;
-  var passengers   = b.passengers    || [];
-  var addons       = b.addons        || [];
-  var baseAmount   = parseFloat(b.baseAmount)   || 0;
-  var creditsToUse = parseFloat(b.creditsToUse) || 0;
-  var confirmEmail = b.confirmationEmail || '';
-  var returnFlight = b.returnFlight  || null;
-
-  if (!flightNumber || !originCode || !destCode || !depDate)
-    return res.status(400).json({ error: 'flightNumber, originCode, destCode and depDate are required' });
-
-  var stripeKey = process.env.STRIPE_SECRET_KEY;
-  if (!stripeKey) return res.status(500).json({ error: 'Payment not configured' });
-  var stripe = Stripe(stripeKey);
-
-  var client;
-  try {
-    client = await pool.connect();
-
-    // Fetch user details for email and credits
-    var uRes = await client.query(
-      'SELECT id,name,email,default_currency FROM users WHERE id=$1', [user.id]
-    );
-    var uRow = uRes.rows[0] || {};
-
-    // Validate and deduct credits
-    var creditsUsed = 0;
-    if (creditsToUse > 0) {
-      var cr = await client.query('SELECT balance FROM credits WHERE user_id=$1', [user.id]);
-      var available = parseFloat((cr.rows[0]&&cr.rows[0].balance)||0);
-      creditsUsed = Math.min(creditsToUse, available);
-      if (creditsUsed > 0) {
-        await client.query('UPDATE credits SET balance=balance-$1 WHERE user_id=$2', [creditsUsed, user.id]);
-      }
-    }
-
-    var total       = Math.max(0.5, baseAmount - creditsUsed);
-    var amountCents = Math.round(total * 100);
-
-    var intent = await stripe.paymentIntents.create({
-      amount:        amountCents,
-      currency:      (uRow.default_currency || 'USD').toLowerCase(),
-      receipt_email: confirmEmail || uRow.email || undefined,
-      description:   'FLYYB booking — ' + originCode + '->' + destCode + ' ' + depDate,
-      metadata:      { userId: String(user.id), flightNumber: flightNumber, originCode: originCode, destCode: destCode, depDate: depDate, cabin: cabin },
-    });
-
-    var bookingRef = 'FLY' + Math.random().toString(36).slice(2,8).toUpperCase();
-
-    // Persist booking
-    try {
-      await client.query(
-        'INSERT INTO bookings (booking_ref,user_id,flight_number,airline_code,origin_code,dest_code,' +
-        'dep_date,dep_time,arr_time,cabin,adults,passengers,addons,total_paid,credits_used,' +
-        "stripe_intent_id,status,confirmation_email,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'confirmed',$17,NOW())",
-        [bookingRef, user.id, flightNumber, airlineCode, originCode, destCode,
-         depDate, depTime, arrTime, cabin, adults,
-         JSON.stringify(passengers), JSON.stringify(addons),
-         total, creditsUsed, intent.id, confirmEmail || uRow.email || null]
-      );
-    } catch (e) { console.error('Booking DB insert (non-fatal):', e.message); }
-
-    // Award 5% credits
-    var creditsToEarn = Math.round(total * 0.05 * 100) / 100;
-    if (creditsToEarn > 0) {
-      try {
-        await client.query('UPDATE credits SET balance=balance+$1 WHERE user_id=$2', [creditsToEarn, user.id]);
-        await client.query(
-          "INSERT INTO credit_transactions (user_id,description,amount,type,created_at) VALUES ($1,$2,$3,'earn',NOW())",
-          [user.id, 'Credits earned from booking ' + bookingRef, creditsToEarn]
-        );
-      } catch (e) { console.error('Credits award (non-fatal):', e.message); }
-    }
-
-    // Save passengers if checkbox checked (handled by frontend calling /api/profiles)
-    // Nothing to do here — frontend calls savePassengersFromBooking separately
-
-    // Send booking confirmation email
-    var emailTo = confirmEmail || uRow.email || '';
-    if (emailTo) {
-      authModule.sendBookingEmail(emailTo, uRow.name, {
-        ref: bookingRef, origin: originCode, dest: destCode,
-        depDate: depDate, depTime: depTime, arrTime: arrTime,
-        cabin: cabin, pax: adults, total: total,
-        sym: uRow.default_currency === 'USD' ? '$' : uRow.default_currency,
-      }).catch(function(e) { console.error('Booking email (non-fatal):', e.message); });
-    }
-
-    // Handle return flight booking if present
-    if (returnFlight) {
-      var rtRef = 'FLY' + Math.random().toString(36).slice(2,8).toUpperCase();
-      try {
-        await client.query(
-          'INSERT INTO bookings (booking_ref,user_id,flight_number,airline_code,origin_code,dest_code,' +
-          'dep_date,dep_time,arr_time,cabin,adults,passengers,addons,total_paid,credits_used,' +
-          "stripe_intent_id,status,confirmation_email,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'confirmed',$17,NOW())",
-          [rtRef, user.id, returnFlight.flightNumber, returnFlight.airlineCode,
-           returnFlight.originCode, returnFlight.destCode,
-           returnFlight.depDate, returnFlight.depTime||'', returnFlight.arrTime||'',
-           cabin, adults, JSON.stringify(passengers), '[]',
-           parseFloat(returnFlight.baseAmount)||0, 0, intent.id,
-           confirmEmail || uRow.email || null]
-        );
-      } catch (e) { console.error('Return flight DB insert (non-fatal):', e.message); }
-    }
-
-    console.log('[Booking] Intent', intent.id, '| ref', bookingRef, '| $' + total);
-    res.json({
-      clientSecret: intent.client_secret,
-      bookingRef:   bookingRef,
-      summary:      { total: total, creditsUsed: creditsUsed, creditsToEarn: creditsToEarn },
-    });
-  } catch (err) {
-    console.error('CreateIntent:', err);
-    res.status(500).json({ error: 'Payment setup failed' });
-  } finally {
-    if (client) client.release();
-  }
-}
+module.exports=function(req,res){
+var action=req.query.action;
+if(action==='webhook')return handleWebhook(req,res);
+auth.cors(req,res);
+if(req.method==='OPTIONS')return;
+if(action==='addons')        return handleAddons(req,res);
+if(action==='credits')       return handleCredits(req,res);
+if(action==='create-intent') return handleCreateIntent(req,res);
+return res.status(400).json({error:'Missing action. Use ?action=addons|credits|create-intent|webhook'});
+};
