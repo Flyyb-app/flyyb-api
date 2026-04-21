@@ -39,14 +39,15 @@ return '<div style="font-family:sans-serif;max-width:560px;margin:0 auto;backgro
 +row('Date',b.date)
 +row('Departure',b.dep)
 +row('Arrival',b.arr)
-+row('Flight',b.flight)
++row('Flight No.',b.flight)
++(b.seats?row('Seats',b.seats):'')
 +row('Cabin',b.cabin)
 +row('Passengers',b.adults)
 +returnSection
 +'<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:16px 0">'
 +'<div style="display:flex;justify-content:space-between"><span style="color:rgba(245,240,232,.5);font-size:13px">Total Paid</span>'
 +'<span style="color:#d4a843;font-weight:600;font-size:16px">$'+b.total+'</span></div>'
-+(b.creditsEarned?'<div style="display:flex;justify-content:space-between;margin-top:8px"><span style="color:rgba(245,240,232,.5);font-size:13px">Credits Earned</span><span style="color:#5daa72">+$'+b.creditsEarned+'</span></div>':'')
++(b.addons&&b.addons.length?'<hr style="border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0">'+'<div style="font-size:11px;color:rgba(212,168,67,.7);letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px">Add-ons</div>'+b.addons.map(function(a){return row('',a);}).join(''):'')+(b.creditsEarned?'<div style="display:flex;justify-content:space-between;margin-top:8px"><span style="color:rgba(245,240,232,.5);font-size:13px">Credits Earned</span><span style="color:#5daa72">+$'+b.creditsEarned+'</span></div>':'')
 +'</div>'
 +'<p style="color:rgba(245,240,232,.4);font-size:12px;text-align:center">Thank you for booking with FLYYB. Visit flyyb.vercel.app to manage your trips.</p>'
 +'</div>';
@@ -182,6 +183,11 @@ dep:retDep?retDep.slice(0,5):'',
 arr:retArr?retArr.slice(0,5):''
 };
 }
+// Fetch seats and addons for email
+var seatsRes=await client.query('SELECT seat_number FROM booking_passengers WHERE booking_id=$1 AND seat_number IS NOT NULL',[bookingId]);
+var seatsStr=seatsRes.rows.map(function(r){return r.seat_number;}).filter(Boolean).join(', ')||null;
+var addonsRes=await client.query('SELECT ac.name,ba.quantity FROM booking_addons ba JOIN addons_catalog ac ON ac.id=ba.addon_id WHERE ba.booking_id=$1',[bookingId]);
+var addonsArr=addonsRes.rows.map(function(a){return a.name+(a.quantity>1?' x'+a.quantity:'');});
 await sendEmail(emailTo,'Your FLYYB Booking is Confirmed - '+bookingRef,confirmationHtml({
 ref:bookingRef,
 origin:(oa.rows[0]&&oa.rows[0].city)||bk.origin_code,
@@ -192,6 +198,8 @@ arr:bk.arr_time?bk.arr_time.slice(0,5):'',
 flight:bk.flight_number,
 cabin:bk.cabin.charAt(0).toUpperCase()+bk.cabin.slice(1),
 adults:bk.adults,
+seats:seatsStr,
+addons:addonsArr,
 total:parseFloat(bk.total_amount).toFixed(2),
 creditsEarned:earned?parseFloat(earned).toFixed(2):null,
 returnFlight:returnFlight
